@@ -1,45 +1,64 @@
-export default async (req, context) => {
+export default async (req) => {
   if (req.method !== "POST") {
     return new Response("Method not allowed", { status: 405 });
   }
 
   try {
-    const { imageB64, carpetedRooms } = await req.json();
+    const { imageB64 } = await req.json();
 
-    const prompt = `You are a professional carpet installation quantity surveyor.
-Analyse this floor plan image carefully.
-Carpeted areas for this job: ${carpetedRooms}
+    const prompt = `You are an expert architectural floor plan analyst.
 
-RESPOND WITH ONLY A JSON OBJECT. No text before or after. No markdown. No code fences.
-Start with { and end with }.
+Carefully analyse this floor plan image. Your job is to map every room's EXACT position and size so I can redraw the floor plan accurately.
+
+CRITICAL INSTRUCTIONS:
+1. Look at the entire floor plan boundary first
+2. For each room, measure its position relative to the TOTAL floor plan bounding box
+3. position x,y = distance from TOP-LEFT of the entire floor plan as a fraction (0.0 to 1.0)
+4. size w,h = room's width and height as a fraction of the TOTAL floor plan width/height
+5. Rooms that share walls should have touching edges (e.g. if room A ends at x=0.5, room B starts at x=0.5)
+6. Read ALL labelled dimensions from the plan text
+7. For scale: find at least 2 labelled rooms, calculate pixels per metre
+
+RESPOND WITH ONLY A JSON OBJECT. No text. No markdown. Start with { end with }.
 
 {
   "scale": {
     "ratio": "128px/m",
-    "references": ["Living/Dining 3.6m wide = 460px"]
+    "pxPerM": 128,
+    "references": ["Living/Dining 3.6m = 460px horizontal"]
+  },
+  "planBounds": {
+    "description": "The outer boundary of the entire floor plan"
   },
   "rooms": [
     {
-      "name": "Bed 1",
-      "widthM": 3.2,
-      "lengthM": 3.0,
+      "name": "Living/Dining",
+      "widthM": 3.6,
+      "lengthM": 5.2,
       "dimensionSource": "labelled",
-      "position": { "x": 0.54, "y": 0.76 },
-      "size": { "w": 0.28, "h": 0.22 },
-      "doorWall": "west",
+      "position": { "x": 0.18, "y": 0.05 },
+      "size": { "w": 0.42, "h": 0.45 },
+      "wallTop": true,
+      "wallRight": true,
+      "wallBottom": true,
+      "wallLeft": true,
+      "doorWall": "south",
+      "doorPos": 0.3,
       "notes": ""
     }
   ],
   "sanityFlags": [],
-  "totalAreaM2": 9.6
+  "totalAreaM2": 18.72
 }
 
-Rules:
-- position x,y = top-left of room as fraction of full image (0.0–1.0)
-- size w,h = room width/height as fraction of full image (0.0–1.0)
-- dimensionSource: "labelled" if shown on plan, "scaled" if calculated
-- doorWall: north / south / east / west
-- totalAreaM2 = sum of all widthM × lengthM`;
+RULES:
+- Every room must be included — bedrooms, living, dining, kitchen, bathroom, hallway, laundry, balcony, robe, ensuite, everything visible
+- Positions must reflect the ACTUAL layout — rooms next to each other should have matching edges
+- wallTop/Right/Bottom/Left = true if that side has an exterior or shared wall
+- doorWall: which wall has the door opening (north/south/east/west)
+- doorPos: position of door along that wall as fraction 0-1
+- dimensionSource: "labelled" if plan shows the number, "scaled" if you calculated it
+- totalAreaM2: sum of all widthM x lengthM`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -50,17 +69,13 @@ Rules:
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 2000,
+        max_tokens: 3000,
         messages: [{
           role: "user",
           content: [
             {
               type: "image",
-              source: {
-                type: "base64",
-                media_type: "image/jpeg",
-                data: imageB64
-              }
+              source: { type: "base64", media_type: "image/jpeg", data: imageB64 }
             },
             { type: "text", text: prompt }
           ]
