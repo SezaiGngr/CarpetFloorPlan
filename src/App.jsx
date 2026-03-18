@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
-/* ─── Compress image ─── */
-function compressImage(file, maxPx = 900, quality = 0.82) {
+function compressImage(file, maxPx = 900, quality = 0.85) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("FileReader failed"));
@@ -34,19 +33,25 @@ function extractJSON(raw) {
     () => JSON.parse(raw.replace(/```json/gi, "").replace(/```/g, "").trim()),
     () => { const a = raw.indexOf("{"), b = raw.lastIndexOf("}"); if (a >= 0 && b > a) return JSON.parse(raw.slice(a, b + 1)); throw 0; }
   ]) { try { return fn(); } catch {} }
-  throw new Error("No JSON found: " + raw.slice(0, 120));
+  throw new Error("No JSON: " + raw.slice(0, 100));
 }
 
-const PALETTE = [
-  { bg: "#1a472a", border: "#2d6a4f", text: "#b7e4c7", accent: "#52b788" },
-  { bg: "#1b263b", border: "#415a77", text: "#a8dadc", accent: "#457b9d" },
-  { bg: "#4a1942", border: "#6d2b6b", text: "#f4c2e8", accent: "#c77daa" },
-  { bg: "#3d2314", border: "#7f4f24", text: "#ffe8d6", accent: "#bc6c25" },
-  { bg: "#1c3a2e", border: "#2d6a4f", text: "#cce8da", accent: "#40916c" },
-  { bg: "#2c1654", border: "#5a189a", text: "#e0aaff", accent: "#9d4edd" },
-  { bg: "#3d0c02", border: "#9b2226", text: "#ffccd5", accent: "#e63946" },
-  { bg: "#0d3b2e", border: "#1b7a5a", text: "#b7e4c7", accent: "#2d9e6b" },
-];
+// Room type colours — blueprint style
+function getRoomColor(name) {
+  const n = name.toLowerCase();
+  if (n.includes("bed") || n.includes("master"))   return { fill: "#1a3a5c", stroke: "#2980b9", text: "#a8d8f0", label: "#7ec8e3" };
+  if (n.includes("living") || n.includes("lounge")) return { fill: "#1a4a2a", stroke: "#27ae60", text: "#a8e6c0", label: "#6dd5a0" };
+  if (n.includes("dining"))                         return { fill: "#1a4a2a", stroke: "#27ae60", text: "#a8e6c0", label: "#6dd5a0" };
+  if (n.includes("kitchen"))                        return { fill: "#3a2a1a", stroke: "#e67e22", text: "#ffd9a8", label: "#f0a060" };
+  if (n.includes("bath") || n.includes("ensuite"))  return { fill: "#1a2a4a", stroke: "#8e44ad", text: "#d8b4f8", label: "#b07dd8" };
+  if (n.includes("garage") || n.includes("car"))    return { fill: "#2a2a2a", stroke: "#7f8c8d", text: "#c0c0c0", label: "#a0a0a0" };
+  if (n.includes("balcony") || n.includes("patio")) return { fill: "#1a3a3a", stroke: "#16a085", text: "#a0e0d8", label: "#60c8c0" };
+  if (n.includes("hall") || n.includes("entry"))    return { fill: "#2a2a1a", stroke: "#d4ac0d", text: "#f8e8a0", label: "#e0c840" };
+  if (n.includes("robe") || n.includes("wardrobe")) return { fill: "#2a1a2a", stroke: "#9b59b6", text: "#e8c0f8", label: "#c090e0" };
+  if (n.includes("laundry") || n.includes("l'dry")) return { fill: "#1a2a3a", stroke: "#2980b9", text: "#a8d8f0", label: "#70b8e0" };
+  if (n.includes("study") || n.includes("office"))  return { fill: "#2a1a1a", stroke: "#c0392b", text: "#f8c0c0", label: "#e08080" };
+  return { fill: "#1e1e2e", stroke: "#5555aa", text: "#c0c0e8", label: "#8080c8" };
+}
 
 export default function App() {
   const [page, setPage]         = useState("home");
@@ -59,22 +64,23 @@ export default function App() {
   const [logs, setLogs]         = useState([]);
   const [tab, setTab]           = useState("plan");
   const [hover, setHover]       = useState(null);
+  const [selectedRoom, setSelectedRoom] = useState(null);
 
   const addLog = useCallback((m) => setLogs(p => [...p, String(m)]), []);
 
   const processFile = useCallback(async (file) => {
     if (!file) return;
     if (!file.type.startsWith("image/")) { setError("Not an image file"); return; }
-    setError(null); setLogs([]); setResult(null);
+    setError(null); setLogs([]); setResult(null); setSelectedRoom(null);
     setImgURL(URL.createObjectURL(file));
-    setProgress("Compressing image…");
+    setProgress("Compressing…");
     addLog(`File: ${file.name} | ${Math.round(file.size / 1024)}KB`);
     try {
-      const data = await compressImage(file, 900, 0.82);
+      const data = await compressImage(file, 900, 0.85);
       setImgData(data);
-      addLog(`Compressed: ${data.w}×${data.h}px | ~${data.kb}KB`);
+      addLog(`Ready: ${data.w}×${data.h}px | ~${data.kb}KB`);
       setProgress("");
-      setPage("preview");
+      setPage("analysing");
     } catch (e) {
       setError("Image error: " + e.message);
       setProgress("");
@@ -91,74 +97,27 @@ export default function App() {
     return () => window.removeEventListener("paste", onPaste);
   }, [processFile]);
 
-  const analyse = useCallback(async (data) => {
-    const imgInfo = data || imgData;
+  const analyse = useCallback(async (imgInfo) => {
     if (!imgInfo) return;
-    setLoading(true); setError(null); setLogs([]); setResult(null);
-    setProgress("Analysing floor plan…");
-    addLog(`Sending: ${imgInfo.kb}KB`);
-
-    const prompt = `You are a professional floor plan analyst and carpet installation quantity surveyor.
-
-Analyse this floor plan image carefully. Identify and measure EVERY room in the floor plan.
-Do NOT skip any room — measure all of them including bedrooms, living areas, hallways, studies, lounge, dining, and any other spaces visible.
-
-For each room:
-1. Read any labelled dimensions directly from the plan
-2. For rooms without labels, calculate dimensions using the scale from labelled rooms
-3. Estimate the position and size as fractions of the full image
-
-RESPOND WITH ONLY A JSON OBJECT. No text before or after. No markdown. Start with { end with }.
-
-{
-  "scale": {
-    "ratio": "128px/m",
-    "references": ["Living/Dining 3.6m wide = 460px"]
-  },
-  "rooms": [
-    {
-      "name": "Bed 1",
-      "widthM": 3.2,
-      "lengthM": 3.0,
-      "dimensionSource": "labelled",
-      "position": { "x": 0.54, "y": 0.76 },
-      "size": { "w": 0.28, "h": 0.22 },
-      "notes": ""
-    }
-  ],
-  "sanityFlags": [],
-  "totalAreaM2": 9.6
-}
-
-Rules:
-- Include EVERY room visible on the plan — do not skip any
-- position x,y = top-left of room as fraction of full image (0.0–1.0)
-- size w,h = room width/height as fraction of full image (0.0–1.0)
-- dimensionSource: "labelled" if shown on plan, "scaled" if you calculated it
-- totalAreaM2 = sum of all widthM × lengthM`;
-
+    setLoading(true); setError(null); setResult(null);
+    setProgress("AI is reading floor plan…");
+    addLog(`Sending ${imgInfo.kb}KB to API`);
     try {
       const resp = await fetch("/api/analyse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageB64: imgInfo.b64, carpetedRooms: "ALL ROOMS" })
+        body: JSON.stringify({ imageB64: imgInfo.b64 })
       });
-
       addLog(`HTTP ${resp.status}`);
       const respData = await resp.json();
       if (respData.error) throw new Error(respData.error);
-      if (!respData.text) throw new Error("No text in response");
-
-      addLog(`Reply: ${respData.text.slice(0, 150)}`);
-      setProgress("Parsing results…");
-
+      addLog(`Reply: ${respData.text?.slice(0, 120)}`);
+      setProgress("Drawing floor plan…");
       const parsed = extractJSON(respData.text);
       if (!Array.isArray(parsed.rooms) || !parsed.rooms.length) throw new Error("No rooms found");
-
       parsed.totalAreaM2 = Math.round(
         parsed.rooms.reduce((s, r) => s + (r.widthM || 0) * (r.lengthM || 0), 0) * 100
       ) / 100;
-
       setResult(parsed);
       setTab("plan");
       setPage("result");
@@ -166,28 +125,27 @@ Rules:
     } catch (e) {
       setError(e.message);
       addLog("✗ " + e.message);
+      setPage("error");
     } finally {
       setLoading(false);
       setProgress("");
     }
-  }, [imgData, addLog]);
+  }, [addLog]);
 
-  // Auto-analyse when image is ready
   useEffect(() => {
-    if (page === "preview" && imgData && !loading && !result) {
+    if (page === "analysing" && imgData) {
       analyse(imgData);
     }
   }, [page, imgData]);
 
   const reset = () => {
     setPage("home"); setImgURL(null); setImgData(null);
-    setResult(null); setError(null); setLogs([]); setHover(null);
+    setResult(null); setError(null); setLogs([]);
+    setHover(null); setSelectedRoom(null);
   };
 
   return (
     <div style={S.shell}>
-
-      {/* TOP BAR */}
       <div style={S.bar}>
         <div onClick={reset} style={S.brand}>
           <span style={{ fontSize: 22, color: "#4CAF50" }}>▦</span>
@@ -196,20 +154,18 @@ Rules:
             <div style={S.bsub}>Ceaser Home · Auto Measure</div>
           </div>
         </div>
-        {page !== "home" && (
+        {page === "result" && (
           <button style={S.newBtn} onClick={reset}>+ New Plan</button>
         )}
       </div>
 
-      {/* ═══ HOME ═══ */}
+      {/* HOME */}
       {page === "home" && (
         <div style={S.page}>
-          <div style={S.heroWrap}>
+          <div style={{ textAlign: "center", marginBottom: 32 }}>
             <div style={S.h1}>Floor Plan Measurer</div>
-            <div style={S.h2}>
-              Upload any floor plan → AI measures every room automatically
-            </div>
-            <div style={S.h3}>No room selection needed — just upload and go</div>
+            <div style={S.h2}>Upload a floor plan photo → AI draws it and measures every room</div>
+            <div style={{ fontSize: 12, color: "#4CAF50", marginTop: 6 }}>No room selection needed — fully automatic</div>
           </div>
 
           <div style={S.uploadBox}
@@ -217,112 +173,124 @@ Rules:
             onDrop={e => { e.preventDefault(); processFile(e.dataTransfer.files[0]); }}>
 
             <label htmlFor="pick" style={S.bigBtn}>
-              <span style={{ fontSize: 36 }}>📐</span>
+              <span style={{ fontSize: 38 }}>📐</span>
               <div>
                 <div style={S.bLabel}>Upload Floor Plan</div>
-                <div style={S.bSub}>Photo · PDF scan · Screenshot</div>
+                <div style={S.bSub}>Photo · Screenshot · Scan</div>
               </div>
             </label>
             <input id="pick" type="file" accept="image/*" style={S.gone}
               onChange={e => { if (e.target.files[0]) processFile(e.target.files[0]); e.target.value = ""; }} />
 
-            <div style={S.orRow}>
-              <div style={S.orLine} /><span style={S.orTxt}>OR</span><div style={S.orLine} />
-            </div>
+            <div style={S.orRow}><div style={S.orLine} /><span style={S.orTxt}>OR</span><div style={S.orLine} /></div>
 
             <label htmlFor="cam" style={{ ...S.bigBtn, background: "#040d18", borderColor: "#183560" }}>
-              <span style={{ fontSize: 36 }}>📷</span>
+              <span style={{ fontSize: 38 }}>📷</span>
               <div>
                 <div style={{ ...S.bLabel, color: "#5aacdc" }}>Take Photo</div>
-                <div style={S.bSub}>Point camera at floor plan</div>
+                <div style={S.bSub}>Point at floor plan</div>
               </div>
             </label>
             <input id="cam" type="file" accept="image/*" capture="environment" style={S.gone}
               onChange={e => { if (e.target.files[0]) processFile(e.target.files[0]); e.target.value = ""; }} />
 
-            <div style={{ fontSize: 11, color: "#141440", textAlign: "center" }}>
-              or drag & drop · or paste Ctrl+V
-            </div>
+            <div style={{ fontSize: 11, color: "#141440", textAlign: "center" }}>or drag & drop · paste Ctrl+V</div>
           </div>
-
-          {progress && <div style={S.pill}>⏳ {progress}</div>}
-          {error && <ErrBox msg={error} logs={logs} />}
         </div>
       )}
 
-      {/* ═══ PREVIEW / ANALYSING ═══ */}
-      {page === "preview" && (
+      {/* ANALYSING */}
+      {page === "analysing" && (
         <div style={S.page}>
-          <div style={S.analysingCard}>
+          <div style={S.analysingWrap}>
             {imgURL && <img src={imgURL} alt="plan" style={S.analysingImg} />}
             <div style={S.analysingOverlay}>
-              <div style={S.spinner}>⟳</div>
-              <div style={S.analysingText}>Measuring all rooms…</div>
-              <div style={S.analysingSubText}>AI is reading your floor plan</div>
+              <div style={S.spinnerWrap}>
+                <div style={S.spinnerRing} />
+                <span style={{ fontSize: 30 }}>▦</span>
+              </div>
+              <div style={S.analysingTitle}>{progress || "Measuring rooms…"}</div>
+              <div style={S.analysingSubtitle}>AI is mapping your floor plan</div>
             </div>
           </div>
-          {error && (
-            <div style={{ marginTop: 16 }}>
-              <ErrBox msg={error} logs={logs} />
-              <button style={{ ...S.bigBtn, marginTop: 12, width: "100%", maxWidth: "100%", justifyContent: "center" }}
-                onClick={() => analyse(imgData)}>
-                <span style={{ fontSize: 20 }}>↺</span>
-                <div><div style={S.bLabel}>Try Again</div></div>
-              </button>
-              <button style={{ ...S.bigBtn, marginTop: 8, width: "100%", maxWidth: "100%", justifyContent: "center", background: "#080810", borderColor: "#202040" }}
-                onClick={reset}>
-                <span style={{ fontSize: 20 }}>←</span>
-                <div><div style={{ ...S.bLabel, color: "#8080c0" }}>Upload Different Plan</div></div>
-              </button>
-            </div>
-          )}
         </div>
       )}
 
-      {/* ═══ RESULT ═══ */}
+      {/* ERROR */}
+      {page === "error" && (
+        <div style={S.page}>
+          {imgURL && <img src={imgURL} alt="plan" style={{ width: "100%", borderRadius: 10, marginBottom: 16, opacity: 0.5 }} />}
+          <div style={S.errBox}>
+            <div style={S.errTitle}>⚠ {error}</div>
+            {logs.map((l, i) => <div key={i} style={S.logLine}>{l}</div>)}
+          </div>
+          <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
+            <button style={{ ...S.bigBtn, flex: 1, maxWidth: "none" }} onClick={() => { setPage("analysing"); analyse(imgData); }}>
+              <span>↺</span><div><div style={S.bLabel}>Try Again</div></div>
+            </button>
+            <button style={{ ...S.bigBtn, flex: 1, maxWidth: "none", background: "#080818", borderColor: "#202040" }} onClick={reset}>
+              <span>←</span><div><div style={{ ...S.bLabel, color: "#8080c0" }}>New Plan</div></div>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* RESULT */}
       {page === "result" && result && (
         <div style={S.page}>
-
-          {/* Summary strip */}
           <div style={S.summary}>
             <div>
-              <div style={S.sLabel}>TOTAL AREA</div>
-              <div style={S.sBig}>{result.totalAreaM2}<span style={{ fontSize: 16, fontWeight: 400 }}> m²</span></div>
+              <div style={S.sLabel}>TOTAL FLOOR AREA</div>
+              <div style={S.sBig}>{result.totalAreaM2}<span style={{ fontSize: 15, fontWeight: 400 }}> m²</span></div>
             </div>
             <div style={{ textAlign: "center" }}>
-              <div style={S.sLabel}>ROOMS FOUND</div>
+              <div style={S.sLabel}>ROOMS</div>
               <div style={{ ...S.sBig, color: "#a8dadc" }}>{result.rooms.length}</div>
             </div>
             <div>
               <div style={S.sLabel}>SCALE</div>
-              <div style={{ fontSize: 11, color: "#304a4a", marginTop: 4, maxWidth: 120 }}>{result.scale?.ratio || "—"}</div>
+              <div style={{ fontSize: 11, color: "#2a4a4a", marginTop: 4 }}>{result.scale?.ratio || "—"}</div>
             </div>
           </div>
 
-          {/* Tabs */}
           <div style={S.tabRow}>
-            {[["plan", "Floor Plan"], ["table", "All Rooms"], ["info", "Details"]].map(([k, l]) => (
+            {[["plan", "Floor Plan"], ["table", "All Rooms"], ["info", "Notes"]].map(([k, l]) => (
               <button key={k} style={{ ...S.tabBtn, ...(tab === k ? S.tabOn : {}) }} onClick={() => setTab(k)}>{l}</button>
             ))}
           </div>
 
-          {/* PLAN TAB */}
           {tab === "plan" && (
             <div>
-              <PlanSVG rooms={result.rooms} hover={hover} setHover={setHover} />
+              {/* Blueprint floor plan */}
+              <BlueprintPlan
+                rooms={result.rooms}
+                hover={hover}
+                setHover={setHover}
+                selected={selectedRoom}
+                setSelected={setSelectedRoom}
+              />
+
+              {/* Selected room detail */}
+              {selectedRoom !== null && result.rooms[selectedRoom] && (
+                <RoomDetail room={result.rooms[selectedRoom]} onClose={() => setSelectedRoom(null)} />
+              )}
+
+              {/* Room list */}
               <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 5 }}>
                 {result.rooms.map((r, i) => {
-                  const c = PALETTE[i % PALETTE.length];
+                  const c = getRoomColor(r.name);
+                  const sc = r.dimensionSource === "scaled";
                   return (
                     <div key={i}
-                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 8, background: hover === i ? "#111128" : "#0a0a18", border: `1px solid ${hover === i ? c.border : "#12123a"}`, cursor: "pointer", transition: "all 0.15s" }}
-                      onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}>
-                      <span style={{ width: 12, height: 12, borderRadius: 3, background: c.accent, flexShrink: 0 }} />
-                      <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: c.text }}>{r.name}</span>
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px", borderRadius: 8, background: hover === i || selectedRoom === i ? "#111128" : "#0a0a18", border: `1px solid ${hover === i ? c.stroke : "#12123a"}`, cursor: "pointer" }}
+                      onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
+                      onClick={() => setSelectedRoom(selectedRoom === i ? null : i)}>
+                      <span style={{ width: 12, height: 12, borderRadius: 3, background: c.stroke, flexShrink: 0 }} />
+                      <span style={{ flex: 1, fontSize: 13, fontWeight: 600, color: c.label }}>{r.name}</span>
                       <span style={{ fontSize: 11, color: "#404070" }}>
-                        {r.dimensionSource === "scaled" ? "~" : ""}{r.widthM} × {r.dimensionSource === "scaled" ? "~" : ""}{r.lengthM}m
+                        {sc ? "~" : ""}{r.widthM} × {sc ? "~" : ""}{r.lengthM}m
                       </span>
-                      <span style={{ fontSize: 14, fontWeight: 700, color: c.accent, minWidth: 60, textAlign: "right" }}>
+                      <span style={{ fontSize: 14, fontWeight: 700, color: c.stroke, minWidth: 60, textAlign: "right" }}>
                         {(r.widthM * r.lengthM).toFixed(2)} m²
                       </span>
                     </div>
@@ -332,7 +300,6 @@ Rules:
             </div>
           )}
 
-          {/* TABLE TAB */}
           {tab === "table" && (
             <div>
               <div style={{ border: "1px solid #14143a", borderRadius: 12, overflow: "hidden" }}>
@@ -342,19 +309,19 @@ Rules:
                   ))}
                 </div>
                 {result.rooms.map((r, i) => {
-                  const c = PALETTE[i % PALETTE.length];
+                  const c = getRoomColor(r.name);
                   const sc = r.dimensionSource === "scaled";
                   return (
                     <div key={i}
                       style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1.2fr 1fr", borderBottom: "1px solid #0a0a1a", background: hover === i ? "#141430" : i % 2 === 0 ? "#080818" : "#0b0b1e", cursor: "pointer" }}
                       onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}>
-                      <div style={{ padding: "10px 8px", fontSize: 13, display: "flex", alignItems: "center", gap: 7, color: c.text }}>
-                        <span style={{ width: 9, height: 9, borderRadius: 2, background: c.accent, flexShrink: 0 }} />
+                      <div style={{ padding: "10px 8px", fontSize: 13, display: "flex", alignItems: "center", gap: 7, color: c.label }}>
+                        <span style={{ width: 9, height: 9, borderRadius: 2, background: c.stroke, flexShrink: 0 }} />
                         {r.name}
                       </div>
                       <div style={S.td}>{sc ? "~" : ""}{r.widthM}m</div>
                       <div style={S.td}>{sc ? "~" : ""}{r.lengthM}m</div>
-                      <div style={{ ...S.td, fontWeight: 700, color: c.accent }}>{(r.widthM * r.lengthM).toFixed(2)}</div>
+                      <div style={{ ...S.td, fontWeight: 700, color: c.stroke }}>{(r.widthM * r.lengthM).toFixed(2)}</div>
                       <div style={{ ...S.td, paddingRight: 10 }}>
                         <span style={{ fontSize: 8, padding: "2px 5px", borderRadius: 3, background: sc ? "#160e00" : "#060e06", color: sc ? "#FFD700" : "#4CAF50", border: `1px solid ${sc ? "#302000" : "#103010"}` }}>
                           {sc ? "scaled" : "labelled"}
@@ -368,20 +335,16 @@ Rules:
                   <div style={{ fontSize: 28, fontWeight: 900, color: "#4CAF50" }}>{result.totalAreaM2} m²</div>
                 </div>
               </div>
-
-              {result.scale && (
-                <div style={{ marginTop: 14, background: "#060e06", border: "1px solid #183018", borderLeft: "4px solid #4CAF50", borderRadius: 10, padding: "14px 16px" }}>
-                  <div style={{ fontSize: 9, letterSpacing: 3, color: "#4CAF50", marginBottom: 6 }}>SCALE CALIBRATION</div>
-                  <div style={{ fontSize: 18, fontWeight: 700, color: "#d0e8d0", marginBottom: 8 }}>{result.scale.ratio}</div>
-                  {result.scale.references?.map((r, i) => (
-                    <div key={i} style={{ fontSize: 11, color: "#306030", marginTop: 4 }}>· {r}</div>
-                  ))}
-                </div>
-              )}
+              <div style={{ marginTop: 14, background: "#060e06", border: "1px solid #183018", borderLeft: "4px solid #4CAF50", borderRadius: 10, padding: "14px 16px" }}>
+                <div style={{ fontSize: 9, letterSpacing: 3, color: "#4CAF50", marginBottom: 6 }}>SCALE CALIBRATION</div>
+                <div style={{ fontSize: 18, fontWeight: 700, color: "#d0e8d0", marginBottom: 8 }}>{result.scale?.ratio || "—"}</div>
+                {result.scale?.references?.map((r, i) => (
+                  <div key={i} style={{ fontSize: 11, color: "#306030", marginTop: 4 }}>· {r}</div>
+                ))}
+              </div>
             </div>
           )}
 
-          {/* INFO TAB */}
           {tab === "info" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
               {result.sanityFlags?.filter(Boolean).length > 0 && (
@@ -415,7 +378,7 @@ Rules:
           )}
 
           <button style={{ ...S.bigBtn, marginTop: 20, width: "100%", maxWidth: "100%", justifyContent: "center" }} onClick={reset}>
-            <span style={{ fontSize: 20 }}>📐</span>
+            <span style={{ fontSize: 22 }}>📐</span>
             <div><div style={S.bLabel}>Measure Another Plan</div></div>
           </button>
         </div>
@@ -424,55 +387,207 @@ Rules:
   );
 }
 
-function ErrBox({ msg, logs }) {
+/* ── Blueprint floor plan SVG ── */
+function BlueprintPlan({ rooms, hover, setHover, selected, setSelected }) {
+  const W = 420, H = 380, PAD = 28;
+  const aW = W - PAD * 2, aH = H - PAD * 2;
+  const WALL = 3;
+
+  // Find actual bounds from room positions
+  let minX = 1, minY = 1, maxX = 0, maxY = 0;
+  rooms.forEach(r => {
+    const x = r.position?.x ?? 0;
+    const y = r.position?.y ?? 0;
+    const w = r.size?.w ?? 0.25;
+    const h = r.size?.h ?? 0.25;
+    minX = Math.min(minX, x);
+    minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x + w);
+    maxY = Math.max(maxY, y + h);
+  });
+  const rangeX = Math.max(maxX - minX, 0.1);
+  const rangeY = Math.max(maxY - minY, 0.1);
+
+  // Map fraction to SVG coords, fitting to available area
+  const toX = (fx) => PAD + ((fx - minX) / rangeX) * aW;
+  const toY = (fy) => PAD + ((fy - minY) / rangeY) * aH;
+  const toW = (fw) => (fw / rangeX) * aW;
+  const toH = (fh) => (fh / rangeY) * aH;
+
   return (
-    <div style={{ marginTop: 10, background: "#0c0303", border: "1px solid #300c0c", borderRadius: 10, padding: "14px 16px" }}>
-      <div style={{ color: "#ff6060", fontWeight: 700, fontSize: 14, marginBottom: logs?.length ? 10 : 0 }}>⚠ {msg}</div>
-      {logs?.map((l, i) => <div key={i} style={{ fontSize: 10, color: "#502020", wordBreak: "break-all", marginTop: 3, lineHeight: 1.4 }}>{l}</div>)}
+    <div style={{ background: "#03080f", border: "2px solid #1a3a5a", borderRadius: 12, overflow: "hidden" }}>
+      <div style={{ padding: "8px 12px", background: "#040d18", borderBottom: "1px solid #1a3a5a", display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 10, color: "#2a6a9a", letterSpacing: 2 }}>FLOOR PLAN</span>
+        <span style={{ fontSize: 9, color: "#1a3a5a", marginLeft: "auto" }}>tap room for details</span>
+      </div>
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
+        <defs>
+          <pattern id="bp" width="20" height="20" patternUnits="userSpaceOnUse">
+            <path d="M 20 0 L 0 0 0 20" fill="none" stroke="#061828" strokeWidth="0.5"/>
+          </pattern>
+          <filter id="glow">
+            <feGaussianBlur stdDeviation="2" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+
+        {/* Background */}
+        <rect width={W} height={H} fill="#03080f"/>
+        <rect width={W} height={H} fill="url(#bp)"/>
+
+        {/* Outer boundary */}
+        <rect x={PAD - 4} y={PAD - 4} width={aW + 8} height={aH + 8}
+          fill="none" stroke="#1a3a5a" strokeWidth="1" strokeDasharray="4 4"/>
+
+        {/* Rooms */}
+        {rooms.map((room, i) => {
+          const c = getRoomColor(room.name);
+          const on = hover === i || selected === i;
+          const px = room.position?.x ?? (0.05 + (i % 3) * 0.32);
+          const py = room.position?.y ?? (0.08 + Math.floor(i / 3) * 0.35);
+          const pw = room.size?.w ?? 0.28;
+          const ph = room.size?.h ?? 0.25;
+
+          const rx = toX(px), ry = toY(py);
+          const rw = Math.max(40, toW(pw));
+          const rh = Math.max(30, toH(ph));
+          const sc = room.dimensionSource === "scaled";
+
+          // Dimension text sizes
+          const nameSize = Math.min(11, Math.max(7, rw / 7));
+          const dimSize  = Math.min(9,  Math.max(6, rw / 9));
+          const areaSize = Math.min(10, Math.max(6, rw / 8));
+
+          // Door arc
+          const dw = room.doorWall || "south";
+          const dp = room.doorPos ?? 0.3;
+          const doorLen = Math.min(rw * 0.25, rh * 0.25, 18);
+          let door = null;
+          if (dw === "south") {
+            const dx = rx + rw * dp;
+            door = <g stroke={c.stroke} fill="none" strokeWidth="1" opacity="0.8">
+              <line x1={dx} y1={ry + rh} x2={dx} y2={ry + rh - doorLen}/>
+              <path d={`M ${dx} ${ry + rh} A ${doorLen} ${doorLen} 0 0 1 ${dx + doorLen} ${ry + rh}`}/>
+            </g>;
+          } else if (dw === "north") {
+            const dx = rx + rw * dp;
+            door = <g stroke={c.stroke} fill="none" strokeWidth="1" opacity="0.8">
+              <line x1={dx} y1={ry} x2={dx} y2={ry + doorLen}/>
+              <path d={`M ${dx} ${ry} A ${doorLen} ${doorLen} 0 0 0 ${dx + doorLen} ${ry}`}/>
+            </g>;
+          } else if (dw === "west") {
+            const dy = ry + rh * dp;
+            door = <g stroke={c.stroke} fill="none" strokeWidth="1" opacity="0.8">
+              <line x1={rx} y1={dy} x2={rx + doorLen} y2={dy}/>
+              <path d={`M ${rx} ${dy} A ${doorLen} ${doorLen} 0 0 1 ${rx} ${dy + doorLen}`}/>
+            </g>;
+          } else if (dw === "east") {
+            const dy = ry + rh * dp;
+            door = <g stroke={c.stroke} fill="none" strokeWidth="1" opacity="0.8">
+              <line x1={rx + rw} y1={dy} x2={rx + rw - doorLen} y2={dy}/>
+              <path d={`M ${rx + rw} ${dy} A ${doorLen} ${doorLen} 0 0 0 ${rx + rw} ${dy + doorLen}`}/>
+            </g>;
+          }
+
+          return (
+            <g key={i} style={{ cursor: "pointer" }}
+              onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}
+              onClick={() => setSelected(selected === i ? null : i)}>
+
+              {/* Room fill */}
+              <rect x={rx} y={ry} width={rw} height={rh}
+                fill={c.fill} opacity={on ? 1 : 0.85}
+                stroke={c.stroke} strokeWidth={on ? WALL + 1 : WALL}
+                filter={on ? "url(#glow)" : ""}/>
+
+              {/* Colour accent bar */}
+              <rect x={rx + WALL} y={ry + WALL} width={rw - WALL * 2} height={4}
+                fill={c.stroke} opacity="0.4"/>
+
+              {/* Door */}
+              {door}
+
+              {/* Dimension lines - width */}
+              {rw > 50 && (
+                <g stroke={c.stroke} strokeWidth="0.5" opacity="0.5">
+                  <line x1={rx + 4} y1={ry + rh - 8} x2={rx + rw - 4} y2={ry + rh - 8}/>
+                  <line x1={rx + 4} y1={ry + rh - 11} x2={rx + 4} y2={ry + rh - 5}/>
+                  <line x1={rx + rw - 4} y1={ry + rh - 11} x2={rx + rw - 4} y2={ry + rh - 5}/>
+                </g>
+              )}
+
+              {/* Room name */}
+              <text x={rx + rw / 2} y={ry + rh / 2 - (rh > 50 ? 10 : 6)} textAnchor="middle"
+                fill={c.text} style={{ fontSize: nameSize, fontWeight: 700, fontFamily: "sans-serif" }}>
+                {room.name}
+              </text>
+
+              {/* Dimensions */}
+              {rh > 40 && (
+                <text x={rx + rw / 2} y={ry + rh / 2 + (rh > 55 ? 4 : 2)} textAnchor="middle"
+                  fill={c.text} opacity="0.7" style={{ fontSize: dimSize, fontFamily: "monospace" }}>
+                  {sc ? "~" : ""}{room.widthM}×{sc ? "~" : ""}{room.lengthM}m
+                </text>
+              )}
+
+              {/* Area */}
+              {rh > 55 && (
+                <text x={rx + rw / 2} y={ry + rh / 2 + 16} textAnchor="middle"
+                  fill={c.stroke} style={{ fontSize: areaSize, fontWeight: 700, fontFamily: "monospace" }}>
+                  {(room.widthM * room.lengthM).toFixed(2)}m²
+                </text>
+              )}
+
+              {/* Scaled indicator */}
+              {sc && (
+                <text x={rx + rw - 3} y={ry + 10} textAnchor="end"
+                  fill="#FFD700" opacity="0.7" style={{ fontSize: 7, fontFamily: "monospace" }}>~</text>
+              )}
+            </g>
+          );
+        })}
+
+        {/* Compass */}
+        <text x={W - 12} y={H - 8} textAnchor="end" fill="#1a3a5a"
+          style={{ fontSize: 9, fontFamily: "monospace", letterSpacing: 1 }}>N↑</text>
+
+        {/* Scale note */}
+        <text x={12} y={H - 8} fill="#1a3a5a"
+          style={{ fontSize: 8, fontFamily: "monospace" }}>
+          ~ = scaled · solid = labelled
+        </text>
+      </svg>
     </div>
   );
 }
 
-function PlanSVG({ rooms, hover, setHover }) {
-  const W = 400, H = 340, P = 20, aW = W - P * 2, aH = H - P * 2;
+/* ── Selected room detail popup ── */
+function RoomDetail({ room, onClose }) {
+  const c = getRoomColor(room.name);
+  const sc = room.dimensionSource === "scaled";
   return (
-    <div style={{ background: "#040410", border: "1px solid #0e0e38", borderRadius: 14, overflow: "hidden" }}>
-      <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
-        <defs>
-          <pattern id="g" width="15" height="15" patternUnits="userSpaceOnUse">
-            <circle cx="7.5" cy="7.5" r="0.4" fill="#0c0c36" />
-          </pattern>
-        </defs>
-        <rect width={W} height={H} fill="#040410" />
-        <rect width={W} height={H} fill="url(#g)" />
-        <rect x={P} y={P} width={aW} height={aH} fill="none" stroke="#141440" strokeWidth="1" rx="4" />
-        {rooms.map((room, i) => {
-          const c = PALETTE[i % PALETTE.length], on = hover === i;
-          const px = Math.min(0.84, Math.max(0.02, room.position?.x ?? (0.04 + (i % 3) * 0.31)));
-          const py = Math.min(0.78, Math.max(0.02, room.position?.y ?? (0.08 + Math.floor(i / 3) * 0.28)));
-          const pw = Math.min(0.48, Math.max(0.12, room.size?.w ?? 0.28));
-          const ph = Math.min(0.45, Math.max(0.10, room.size?.h ?? 0.22));
-          const rx = P + px * aW, ry = P + py * aH, rw = pw * aW, rh = ph * aH;
-          const sc = room.dimensionSource === "scaled";
-          return (
-            <g key={i} style={{ cursor: "pointer" }}
-              onMouseEnter={() => setHover(i)} onMouseLeave={() => setHover(null)}>
-              {on && <rect x={rx + 4} y={ry + 4} width={rw} height={rh} fill={c.accent} opacity="0.15" rx="5" />}
-              <rect x={rx} y={ry} width={rw} height={rh} fill={c.bg} opacity={on ? 1 : 0.82}
-                stroke={on ? c.accent : c.border} strokeWidth={on ? 2.5 : 1.5} rx="4" />
-              <rect x={rx + 2} y={ry + 2} width={rw - 4} height={4} fill={c.accent} opacity="0.5" rx="2" />
-              <text x={rx + rw / 2} y={ry + rh / 2 - 9} textAnchor="middle" fill={c.text}
-                style={{ fontSize: Math.min(11, rw / 5.5), fontWeight: 700, fontFamily: "sans-serif" }}>{room.name}</text>
-              <text x={rx + rw / 2} y={ry + rh / 2 + 4} textAnchor="middle" fill={c.text} opacity="0.7"
-                style={{ fontSize: Math.min(9, rw / 7), fontFamily: "monospace" }}>
-                {sc ? "~" : ""}{room.widthM}×{sc ? "~" : ""}{room.lengthM}m</text>
-              <text x={rx + rw / 2} y={ry + rh / 2 + 16} textAnchor="middle" fill={c.accent}
-                style={{ fontSize: Math.min(10, rw / 6.5), fontWeight: 700, fontFamily: "monospace" }}>
-                {(room.widthM * room.lengthM).toFixed(2)}m²</text>
-            </g>
-          );
-        })}
-      </svg>
+    <div style={{ background: c.fill, border: `2px solid ${c.stroke}`, borderRadius: 12, padding: "14px 16px", marginTop: 10, position: "relative" }}>
+      <button onClick={onClose} style={{ position: "absolute", top: 8, right: 10, background: "transparent", border: "none", color: c.text, fontSize: 18, cursor: "pointer" }}>×</button>
+      <div style={{ fontSize: 9, letterSpacing: 3, color: c.stroke, marginBottom: 4 }}>ROOM DETAIL</div>
+      <div style={{ fontSize: 18, fontWeight: 800, color: c.label, marginBottom: 10 }}>{room.name}</div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+        <div>
+          <div style={{ fontSize: 8, color: c.text, opacity: 0.6, letterSpacing: 1 }}>WIDTH</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: c.text }}>{sc ? "~" : ""}{room.widthM}m</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 8, color: c.text, opacity: 0.6, letterSpacing: 1 }}>LENGTH</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: c.text }}>{sc ? "~" : ""}{room.lengthM}m</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 8, color: c.text, opacity: 0.6, letterSpacing: 1 }}>AREA</div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: c.stroke }}>{(room.widthM * room.lengthM).toFixed(2)} m²</div>
+        </div>
+      </div>
+      {room.notes && <div style={{ marginTop: 10, fontSize: 12, color: c.text, opacity: 0.7 }}>{room.notes}</div>}
+      <div style={{ marginTop: 8, fontSize: 9, color: c.text, opacity: 0.5 }}>
+        Source: {room.dimensionSource} · Door: {room.doorWall || "—"}
+      </div>
     </div>
   );
 }
@@ -485,32 +600,32 @@ const S = {
   bsub:     { fontSize: 8, color: "#181840", letterSpacing: 2 },
   newBtn:   { marginLeft: "auto", background: "#4CAF50", color: "#000", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 13, fontWeight: 700, cursor: "pointer" },
   page:     { flex: 1, padding: "20px 16px", maxWidth: 680, margin: "0 auto", width: "100%", boxSizing: "border-box" },
-  heroWrap: { textAlign: "center", marginBottom: 28 },
   h1:       { fontSize: 26, fontWeight: 900, color: "#c0c0e0", marginBottom: 10 },
-  h2:       { fontSize: 14, color: "#303060", lineHeight: 1.5, marginBottom: 6 },
-  h3:       { fontSize: 12, color: "#4CAF50", letterSpacing: 1 },
+  h2:       { fontSize: 13, color: "#303060", lineHeight: 1.6 },
   uploadBox:{ background: "#040410", border: "2px dashed #141440", borderRadius: 16, padding: "28px 20px", display: "flex", flexDirection: "column", alignItems: "center", gap: 14 },
-  bigBtn:   { display: "flex", alignItems: "center", justifyContent: "center", gap: 16, background: "#081408", border: "2px solid #204820", borderRadius: 14, padding: "16px 28px", cursor: "pointer", width: "100%", maxWidth: 340, boxSizing: "border-box", textDecoration: "none" },
-  bLabel:   { fontSize: 17, fontWeight: 700, color: "#4CAF50", letterSpacing: 1 },
+  bigBtn:   { display: "flex", alignItems: "center", justifyContent: "center", gap: 16, background: "#081408", border: "2px solid #204820", borderRadius: 14, padding: "16px 28px", cursor: "pointer", width: "100%", maxWidth: 340, boxSizing: "border-box" },
+  bLabel:   { fontSize: 16, fontWeight: 700, color: "#4CAF50", letterSpacing: 1 },
   bSub:     { fontSize: 11, color: "#2a4a2a", marginTop: 2 },
   gone:     { position: "absolute", opacity: 0, width: 0, height: 0, pointerEvents: "none" },
   orRow:    { display: "flex", alignItems: "center", gap: 12, width: "100%", maxWidth: 340 },
   orLine:   { flex: 1, height: 1, background: "#0e0e38" },
   orTxt:    { fontSize: 9, color: "#141440", letterSpacing: 2 },
-  pill:     { marginTop: 12, background: "#060e06", border: "1px solid #183018", borderRadius: 10, padding: "12px 18px", fontSize: 13, color: "#4CAF50", textAlign: "center" },
-  analysingCard: { position: "relative", borderRadius: 14, overflow: "hidden", background: "#040410", border: "1px solid #0e0e38" },
-  analysingImg: { width: "100%", display: "block", opacity: 0.4 },
-  analysingOverlay: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(4,4,16,0.7)" },
-  spinner:  { fontSize: 40, color: "#4CAF50", animation: "spin 1.5s linear infinite", marginBottom: 12 },
-  analysingText: { fontSize: 18, fontWeight: 700, color: "#4CAF50", letterSpacing: 1 },
-  analysingSubText: { fontSize: 12, color: "#2a4a2a", marginTop: 6 },
+  analysingWrap: { position: "relative", borderRadius: 14, overflow: "hidden", background: "#040410", border: "1px solid #0e0e38", minHeight: 260 },
+  analysingImg: { width: "100%", display: "block", opacity: 0.35 },
+  analysingOverlay: { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" },
+  spinnerWrap: { position: "relative", width: 60, height: 60, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 16 },
+  spinnerRing: { position: "absolute", width: 60, height: 60, borderRadius: "50%", border: "3px solid transparent", borderTop: "3px solid #4CAF50", animation: "spin 1s linear infinite" },
+  analysingTitle: { fontSize: 18, fontWeight: 700, color: "#4CAF50" },
+  analysingSubtitle: { fontSize: 12, color: "#2a4a2a", marginTop: 6 },
   summary:  { display: "flex", gap: 16, padding: "14px 16px", background: "#040410", borderRadius: 14, marginBottom: 16, alignItems: "center", flexWrap: "wrap", border: "1px solid #0e0e38" },
   sLabel:   { fontSize: 8, letterSpacing: 3, color: "#1a1a50", marginBottom: 2 },
-  sBig:     { fontSize: 30, fontWeight: 900, color: "#4CAF50" },
+  sBig:     { fontSize: 28, fontWeight: 900, color: "#4CAF50" },
   tabRow:   { display: "flex", borderBottom: "2px solid #0c0c30", marginBottom: 16 },
   tabBtn:   { flex: 1, padding: "10px 4px", background: "transparent", border: "none", color: "#1a1a48", fontSize: 12, fontWeight: 700, cursor: "pointer", letterSpacing: 1, borderBottom: "2px solid transparent", marginBottom: -2 },
   tabOn:    { color: "#4CAF50", borderBottom: "2px solid #4CAF50" },
   td:       { padding: "10px 8px", fontSize: 13, textAlign: "right", color: "#505090" },
   iHead:    { fontSize: 9, letterSpacing: 3, color: "#4CAF50", fontWeight: 700, marginBottom: 6 },
-  logLine:  { fontSize: 10, color: "#3a1a1a", wordBreak: "break-all", marginTop: 3, lineHeight: 1.4 },
+  errBox:   { background: "#0c0303", border: "1px solid #300c0c", borderRadius: 10, padding: "14px 16px" },
+  errTitle: { color: "#ff6060", fontWeight: 700, fontSize: 14, marginBottom: 8 },
+  logLine:  { fontSize: 10, color: "#502020", wordBreak: "break-all", marginTop: 3, lineHeight: 1.4 },
 };
