@@ -8,81 +8,109 @@ export default async (req) => {
 
     const prompt = `You are an expert architectural floor plan analyst.
 
-Analyse this floor plan image carefully. Your task is to map every room's position and size as a grid so they fit together like puzzle pieces — NO overlaps allowed.
+Analyse this floor plan image. Map every room's position accurately.
 
-CRITICAL RULE: Rooms must NOT overlap. If room A ends at x=0.5, room B that sits beside it starts at x=0.5. They share an edge but never overlap.
+═══════════════════════════════════════════════
+COORDINATE SYSTEM — READ THIS CAREFULLY:
+═══════════════════════════════════════════════
+• The floor plan is a rectangle. Top-left corner = (x:0, y:0). Bottom-right corner = (x:1, y:1).
+• x axis = HORIZONTAL. x increases going RIGHT across the image. LEFT rooms have SMALL x. RIGHT rooms have LARGE x.
+• y axis = VERTICAL. y increases going DOWN the image. TOP rooms have SMALL y. BOTTOM rooms have LARGE y.
+• position.x = how far from the LEFT edge (0=far left, 1=far right)
+• position.y = how far from the TOP edge (0=very top, 1=very bottom)
+• size.w = room width as fraction of total plan WIDTH (horizontal)
+• size.h = room height as fraction of total plan HEIGHT (vertical)
+
+EXAMPLE — a room in the TOP-LEFT corner:
+  position: { x: 0.0, y: 0.0 }, size: { w: 0.3, h: 0.2 }
+
+EXAMPLE — a room in the BOTTOM-RIGHT corner:
+  position: { x: 0.7, y: 0.8 }, size: { w: 0.3, h: 0.2 }
+
+EXAMPLE — a room directly to the RIGHT of the above top-left room:
+  position: { x: 0.3, y: 0.0 }, size: { w: 0.3, h: 0.2 }
+
+EXAMPLE — a room directly BELOW the top-left room:
+  position: { x: 0.0, y: 0.2 }, size: { w: 0.3, h: 0.2 }
+═══════════════════════════════════════════════
 
 STEP 1 — ESTABLISH SCALE
-Find labelled rooms and calculate pixels per metre.
+Find at least 2 rooms with labelled dimensions. Calculate pixels per metre.
 
-STEP 2 — MAP THE GRID
-Think of the entire floor plan as a rectangle from (0,0) to (1,1).
-For EACH room, define:
-- position.x, position.y = top-left corner of this room (fractions 0.0–1.0)
-- size.w, size.h = width and height of this room (fractions 0.0–1.0)
+STEP 2 — IDENTIFY ROWS
+Look at the floor plan and list which rooms are on the same horizontal level (same row).
+For example:
+  Row 1 (top): Bedroom 2, Bath, WC, Laundry
+  Row 2 (middle): Dining, Kitchen
+  Row 3 (bottom): Main Bedroom, Bedroom 3, Lounge
 
-RULES FOR NON-OVERLAPPING:
-- Two rooms side by side: left.x + left.size.w = right.x (they share a wall edge)
-- Two rooms top/bottom: top.y + top.size.h = bottom.y (they share a wall edge)  
-- A room ABOVE another must have a SMALLER y value
-- Room areas must match their labelled dimensions proportionally
-- Check: for any two rooms A and B, they must NOT satisfy ALL of:
-  A.x < B.x+B.w AND A.x+A.w > B.x AND A.y < B.y+B.h AND A.y+A.h > B.y
+STEP 3 — ASSIGN COORDINATES
+For each room:
+- Rooms in the SAME ROW have the SAME or similar position.y value
+- Rooms side by side have DIFFERENT position.x values
+- A room to the RIGHT of another has a LARGER position.x
+- A room BELOW another has a LARGER position.y
+- NO TWO ROOMS should overlap (their rectangles must not intersect)
 
-STEP 3 — DETECT YELLOW MARKINGS
+STEP 4 — DETECT YELLOW MARKINGS
 Yellow highlights on walls = doors or windows.
-Record wall (north/south/east/west), position along wall (posStart 0–1, posEnd 0–1), widthM, type (door/window).
+Record: wall (north/south/east/west), posStart (0–1), posEnd (0–1), widthM, type (door or window).
 
-RESPOND WITH ONLY A JSON OBJECT. No text. No markdown. Start with { end with }.
+RESPOND WITH ONLY A JSON OBJECT. No text before or after. No markdown. Start with { end with }.
 
 {
   "scale": {
     "ratio": "64px/m",
     "pxPerM": 64,
-    "references": ["Living 5m wide = 320px"]
+    "references": ["Lounge 3.8m wide = 243px horizontal"]
   },
+  "layoutRows": [
+    "Row 1 (y≈0.0–0.25): Bedroom 2, WC, Bath, Laundry",
+    "Row 2 (y≈0.25–0.55): Dining, Kitchen, Main Bedroom",
+    "Row 3 (y≈0.55–0.85): Bedroom 3, Lounge"
+  ],
   "rooms": [
     {
-      "name": "Bed 2",
-      "widthM": 2.8,
+      "name": "Bedroom 2",
+      "widthM": 2.5,
       "lengthM": 3.6,
       "dimensionSource": "labelled",
-      "position": { "x": 0.00, "y": 0.00 },
-      "size": { "w": 0.28, "h": 0.35 },
+      "position": { "x": 0.00, "y": 0.22 },
+      "size": { "w": 0.22, "h": 0.28 },
       "openings": [
-        { "type": "door", "wall": "south", "posStart": 0.6, "posEnd": 0.9, "widthM": 0.9 }
+        { "type": "door", "wall": "east", "posStart": 0.6, "posEnd": 0.9, "widthM": 0.9 }
       ],
       "notes": ""
     },
     {
-      "name": "Bath",
-      "widthM": 2.8,
-      "lengthM": 2.5,
-      "dimensionSource": "labelled",
-      "position": { "x": 0.28, "y": 0.00 },
-      "size": { "w": 0.18, "h": 0.28 },
+      "name": "WC",
+      "widthM": 1.2,
+      "lengthM": 2.0,
+      "dimensionSource": "scaled",
+      "position": { "x": 0.22, "y": 0.22 },
+      "size": { "w": 0.10, "h": 0.14 },
       "openings": [],
-      "notes": ""
+      "notes": "shares north wall with Bath"
     },
     {
-      "name": "Bed 1",
-      "widthM": 3.9,
-      "lengthM": 3.6,
+      "name": "Bath",
+      "widthM": 1.8,
+      "lengthM": 2.2,
       "dimensionSource": "labelled",
-      "position": { "x": 0.46, "y": 0.00 },
-      "size": { "w": 0.36, "h": 0.35 },
+      "position": { "x": 0.32, "y": 0.22 },
+      "size": { "w": 0.16, "h": 0.18 },
       "openings": [],
       "notes": ""
     }
   ],
   "sanityFlags": [],
-  "totalAreaM2": 45.0
+  "totalAreaM2": 0
 }
 
-IMPORTANT LAYOUT VERIFICATION — before outputting, mentally check each pair of rooms:
-- Rooms in the SAME ROW: their y and y+h ranges must overlap, their x ranges must NOT overlap
-- Rooms in DIFFERENT ROWS: their y ranges must NOT overlap
-- No two rooms should have overlapping x AND y ranges at the same time`;
+FINAL CHECK before responding:
+For every pair of rooms A and B, verify they do NOT both satisfy:
+  A.x < B.x+B.w  AND  A.x+A.w > B.x  AND  A.y < B.y+B.h  AND  A.y+A.h > B.y
+If any pair overlaps, fix by adjusting x or y so they share an edge but do not overlap.`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
