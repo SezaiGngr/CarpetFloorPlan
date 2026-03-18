@@ -8,57 +8,81 @@ export default async (req) => {
 
     const prompt = `You are an expert architectural floor plan analyst.
 
-Carefully analyse this floor plan image. Your job is to map every room's EXACT position and size so I can redraw the floor plan accurately.
+Analyse this floor plan image carefully. Your task is to map every room's position and size as a grid so they fit together like puzzle pieces — NO overlaps allowed.
 
-CRITICAL INSTRUCTIONS:
-1. Look at the entire floor plan boundary first
-2. For each room, measure its position relative to the TOTAL floor plan bounding box
-3. position x,y = distance from TOP-LEFT of the entire floor plan as a fraction (0.0 to 1.0)
-4. size w,h = room's width and height as a fraction of the TOTAL floor plan width/height
-5. Rooms that share walls should have touching edges (e.g. if room A ends at x=0.5, room B starts at x=0.5)
-6. Read ALL labelled dimensions from the plan text
-7. For scale: find at least 2 labelled rooms, calculate pixels per metre
+CRITICAL RULE: Rooms must NOT overlap. If room A ends at x=0.5, room B that sits beside it starts at x=0.5. They share an edge but never overlap.
+
+STEP 1 — ESTABLISH SCALE
+Find labelled rooms and calculate pixels per metre.
+
+STEP 2 — MAP THE GRID
+Think of the entire floor plan as a rectangle from (0,0) to (1,1).
+For EACH room, define:
+- position.x, position.y = top-left corner of this room (fractions 0.0–1.0)
+- size.w, size.h = width and height of this room (fractions 0.0–1.0)
+
+RULES FOR NON-OVERLAPPING:
+- Two rooms side by side: left.x + left.size.w = right.x (they share a wall edge)
+- Two rooms top/bottom: top.y + top.size.h = bottom.y (they share a wall edge)  
+- A room ABOVE another must have a SMALLER y value
+- Room areas must match their labelled dimensions proportionally
+- Check: for any two rooms A and B, they must NOT satisfy ALL of:
+  A.x < B.x+B.w AND A.x+A.w > B.x AND A.y < B.y+B.h AND A.y+A.h > B.y
+
+STEP 3 — DETECT YELLOW MARKINGS
+Yellow highlights on walls = doors or windows.
+Record wall (north/south/east/west), position along wall (posStart 0–1, posEnd 0–1), widthM, type (door/window).
 
 RESPOND WITH ONLY A JSON OBJECT. No text. No markdown. Start with { end with }.
 
 {
   "scale": {
-    "ratio": "128px/m",
-    "pxPerM": 128,
-    "references": ["Living/Dining 3.6m = 460px horizontal"]
-  },
-  "planBounds": {
-    "description": "The outer boundary of the entire floor plan"
+    "ratio": "64px/m",
+    "pxPerM": 64,
+    "references": ["Living 5m wide = 320px"]
   },
   "rooms": [
     {
-      "name": "Living/Dining",
-      "widthM": 3.6,
-      "lengthM": 5.2,
+      "name": "Bed 2",
+      "widthM": 2.8,
+      "lengthM": 3.6,
       "dimensionSource": "labelled",
-      "position": { "x": 0.18, "y": 0.05 },
-      "size": { "w": 0.42, "h": 0.45 },
-      "wallTop": true,
-      "wallRight": true,
-      "wallBottom": true,
-      "wallLeft": true,
-      "doorWall": "south",
-      "doorPos": 0.3,
+      "position": { "x": 0.00, "y": 0.00 },
+      "size": { "w": 0.28, "h": 0.35 },
+      "openings": [
+        { "type": "door", "wall": "south", "posStart": 0.6, "posEnd": 0.9, "widthM": 0.9 }
+      ],
+      "notes": ""
+    },
+    {
+      "name": "Bath",
+      "widthM": 2.8,
+      "lengthM": 2.5,
+      "dimensionSource": "labelled",
+      "position": { "x": 0.28, "y": 0.00 },
+      "size": { "w": 0.18, "h": 0.28 },
+      "openings": [],
+      "notes": ""
+    },
+    {
+      "name": "Bed 1",
+      "widthM": 3.9,
+      "lengthM": 3.6,
+      "dimensionSource": "labelled",
+      "position": { "x": 0.46, "y": 0.00 },
+      "size": { "w": 0.36, "h": 0.35 },
+      "openings": [],
       "notes": ""
     }
   ],
   "sanityFlags": [],
-  "totalAreaM2": 18.72
+  "totalAreaM2": 45.0
 }
 
-RULES:
-- Every room must be included — bedrooms, living, dining, kitchen, bathroom, hallway, laundry, balcony, robe, ensuite, everything visible
-- Positions must reflect the ACTUAL layout — rooms next to each other should have matching edges
-- wallTop/Right/Bottom/Left = true if that side has an exterior or shared wall
-- doorWall: which wall has the door opening (north/south/east/west)
-- doorPos: position of door along that wall as fraction 0-1
-- dimensionSource: "labelled" if plan shows the number, "scaled" if you calculated it
-- totalAreaM2: sum of all widthM x lengthM`;
+IMPORTANT LAYOUT VERIFICATION — before outputting, mentally check each pair of rooms:
+- Rooms in the SAME ROW: their y and y+h ranges must overlap, their x ranges must NOT overlap
+- Rooms in DIFFERENT ROWS: their y ranges must NOT overlap
+- No two rooms should have overlapping x AND y ranges at the same time`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -69,14 +93,11 @@ RULES:
       },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 3000,
+        max_tokens: 4000,
         messages: [{
           role: "user",
           content: [
-            {
-              type: "image",
-              source: { type: "base64", media_type: "image/jpeg", data: imageB64 }
-            },
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageB64 } },
             { type: "text", text: prompt }
           ]
         }]
@@ -84,24 +105,20 @@ RULES:
     });
 
     const data = await response.json();
-
     if (data.error) {
       return new Response(JSON.stringify({ error: data.error.message }), {
-        status: 500,
-        headers: { "Content-Type": "application/json" }
+        status: 500, headers: { "Content-Type": "application/json" }
       });
     }
 
     const text = data.content?.find(b => b.type === "text")?.text || "";
     return new Response(JSON.stringify({ text }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" }
+      status: 200, headers: { "Content-Type": "application/json" }
     });
 
   } catch (err) {
     return new Response(JSON.stringify({ error: err.message }), {
-      status: 500,
-      headers: { "Content-Type": "application/json" }
+      status: 500, headers: { "Content-Type": "application/json" }
     });
   }
 };
