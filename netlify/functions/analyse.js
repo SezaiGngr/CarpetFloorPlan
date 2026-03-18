@@ -4,113 +4,82 @@ export default async (req) => {
   }
 
   try {
-    const { imageB64 } = await req.json();
+    const { imageB64, imgW, imgH } = await req.json();
 
     const prompt = `You are an expert architectural floor plan analyst.
 
-Analyse this floor plan image. Map every room's position accurately.
+Analyse this floor plan image (${imgW} x ${imgH} pixels).
 
-═══════════════════════════════════════════════
-COORDINATE SYSTEM — READ THIS CAREFULLY:
-═══════════════════════════════════════════════
-• The floor plan is a rectangle. Top-left corner = (x:0, y:0). Bottom-right corner = (x:1, y:1).
-• x axis = HORIZONTAL. x increases going RIGHT across the image. LEFT rooms have SMALL x. RIGHT rooms have LARGE x.
-• y axis = VERTICAL. y increases going DOWN the image. TOP rooms have SMALL y. BOTTOM rooms have LARGE y.
-• position.x = how far from the LEFT edge (0=far left, 1=far right)
-• position.y = how far from the TOP edge (0=very top, 1=very bottom)
-• size.w = room width as fraction of total plan WIDTH (horizontal)
-• size.h = room height as fraction of total plan HEIGHT (vertical)
+YOUR TASK: For each room, find its exact pixel bounding box in the image.
 
-EXAMPLE — a room in the TOP-LEFT corner:
-  position: { x: 0.0, y: 0.0 }, size: { w: 0.3, h: 0.2 }
+PIXEL COORDINATE RULES:
+- pixel_x increases going RIGHT (left edge of image = 0, right edge = ${imgW})
+- pixel_y increases going DOWN (top edge of image = 0, bottom edge = ${imgH})
+- pixel_left = x coordinate of the LEFT wall of this room
+- pixel_top = y coordinate of the TOP wall of this room
+- pixel_right = x coordinate of the RIGHT wall of this room
+- pixel_bottom = y coordinate of the BOTTOM wall of this room
 
-EXAMPLE — a room in the BOTTOM-RIGHT corner:
-  position: { x: 0.7, y: 0.8 }, size: { w: 0.3, h: 0.2 }
+HOW TO MEASURE:
+1. Find the floor plan boundary in the image
+2. For each room, look at where its walls are in the image
+3. Record the pixel coordinates of each wall precisely
+4. Rooms sharing a wall will have matching pixel values (e.g. room A pixel_right = room B pixel_left)
 
-EXAMPLE — a room directly to the RIGHT of the above top-left room:
-  position: { x: 0.3, y: 0.0 }, size: { w: 0.3, h: 0.2 }
+STEP 1 - SCALE
+Find labelled rooms, measure them in pixels, calculate px/metre.
 
-EXAMPLE — a room directly BELOW the top-left room:
-  position: { x: 0.0, y: 0.2 }, size: { w: 0.3, h: 0.2 }
-═══════════════════════════════════════════════
+STEP 2 - MAP EVERY ROOM
+Measure pixel_left, pixel_top, pixel_right, pixel_bottom for each room.
 
-STEP 1 — ESTABLISH SCALE
-Find at least 2 rooms with labelled dimensions. Calculate pixels per metre.
-
-STEP 2 — IDENTIFY ROWS
-Look at the floor plan and list which rooms are on the same horizontal level (same row).
-For example:
-  Row 1 (top): Bedroom 2, Bath, WC, Laundry
-  Row 2 (middle): Dining, Kitchen
-  Row 3 (bottom): Main Bedroom, Bedroom 3, Lounge
-
-STEP 3 — ASSIGN COORDINATES
-For each room:
-- Rooms in the SAME ROW have the SAME or similar position.y value
-- Rooms side by side have DIFFERENT position.x values
-- A room to the RIGHT of another has a LARGER position.x
-- A room BELOW another has a LARGER position.y
-- NO TWO ROOMS should overlap (their rectangles must not intersect)
-
-STEP 4 — DETECT YELLOW MARKINGS
+STEP 3 - DETECT YELLOW MARKINGS
 Yellow highlights on walls = doors or windows.
-Record: wall (north/south/east/west), posStart (0–1), posEnd (0–1), widthM, type (door or window).
+For each yellow marking record: wall (north/south/east/west), posStart (0-1 along that wall), posEnd (0-1), widthM, type (door or window).
 
-RESPOND WITH ONLY A JSON OBJECT. No text before or after. No markdown. Start with { end with }.
+RESPOND WITH ONLY RAW JSON. No text. No markdown. Start with { end with }.
 
 {
+  "imageWidth": ${imgW},
+  "imageHeight": ${imgH},
   "scale": {
-    "ratio": "64px/m",
-    "pxPerM": 64,
-    "references": ["Lounge 3.8m wide = 243px horizontal"]
+    "ratio": "2.5px/cm or 25px/m",
+    "pxPerM": 25.0,
+    "references": ["Lounge 3.8m wide = measured 95px wide in image"]
   },
-  "layoutRows": [
-    "Row 1 (y≈0.0–0.25): Bedroom 2, WC, Bath, Laundry",
-    "Row 2 (y≈0.25–0.55): Dining, Kitchen, Main Bedroom",
-    "Row 3 (y≈0.55–0.85): Bedroom 3, Lounge"
-  ],
   "rooms": [
+    {
+      "name": "Covered Entertaining Area",
+      "widthM": 4.0,
+      "lengthM": 11.7,
+      "dimensionSource": "labelled",
+      "pixel_left": 120,
+      "pixel_top": 45,
+      "pixel_right": 420,
+      "pixel_bottom": 340,
+      "openings": [],
+      "notes": ""
+    },
     {
       "name": "Bedroom 2",
       "widthM": 2.5,
       "lengthM": 3.6,
       "dimensionSource": "labelled",
-      "position": { "x": 0.00, "y": 0.22 },
-      "size": { "w": 0.22, "h": 0.28 },
+      "pixel_left": 120,
+      "pixel_top": 340,
+      "pixel_right": 280,
+      "pixel_bottom": 520,
       "openings": [
-        { "type": "door", "wall": "east", "posStart": 0.6, "posEnd": 0.9, "widthM": 0.9 }
+        { "type": "door", "wall": "east", "posStart": 0.5, "posEnd": 0.85, "widthM": 0.9 }
       ],
-      "notes": ""
-    },
-    {
-      "name": "WC",
-      "widthM": 1.2,
-      "lengthM": 2.0,
-      "dimensionSource": "scaled",
-      "position": { "x": 0.22, "y": 0.22 },
-      "size": { "w": 0.10, "h": 0.14 },
-      "openings": [],
-      "notes": "shares north wall with Bath"
-    },
-    {
-      "name": "Bath",
-      "widthM": 1.8,
-      "lengthM": 2.2,
-      "dimensionSource": "labelled",
-      "position": { "x": 0.32, "y": 0.22 },
-      "size": { "w": 0.16, "h": 0.18 },
-      "openings": [],
       "notes": ""
     }
   ],
-  "sanityFlags": [],
   "totalAreaM2": 0
 }
 
-FINAL CHECK before responding:
-For every pair of rooms A and B, verify they do NOT both satisfy:
-  A.x < B.x+B.w  AND  A.x+A.w > B.x  AND  A.y < B.y+B.h  AND  A.y+A.h > B.y
-If any pair overlaps, fix by adjusting x or y so they share an edge but do not overlap.`;
+CRITICAL: pixel_left < pixel_right always. pixel_top < pixel_bottom always.
+Rooms that share a wall must have matching pixel values.
+Include ALL rooms visible on the plan.`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
