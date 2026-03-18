@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 
+/* ─── Compress image, preserve exact dimensions ─── */
 function compressImage(file, maxPx = 900, quality = 0.85) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -32,72 +33,66 @@ function extractJSON(raw) {
     () => JSON.parse(raw.replace(/```json/gi, "").replace(/```/g, "").trim()),
     () => { const a = raw.indexOf("{"), b = raw.lastIndexOf("}"); if (a >= 0 && b > a) return JSON.parse(raw.slice(a, b + 1)); throw 0; }
   ]) { try { return fn(); } catch {} }
-  throw new Error("No JSON: " + raw.slice(0, 100));
+  throw new Error("No JSON found in response");
 }
 
-// Check overlap between two rooms (with 1% tolerance)
+/* ─── Convert pixel coords to normalised 0-1 fractions ─── */
+function normaliseRooms(rooms, imgW, imgH) {
+  if (!imgW || !imgH) return rooms;
+
+  // Find actual floor plan bounds (min/max of all pixel coords)
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  rooms.forEach(r => {
+    const l = r.pixel_left  ?? 0, t = r.pixel_top    ?? 0;
+    const ri = r.pixel_right ?? imgW, b = r.pixel_bottom ?? imgH;
+    if (l  < minX) minX = l;  if (t < minY) minY = t;
+    if (ri > maxX) maxX = ri; if (b > maxY) maxY = b;
+  });
+
+  const rangeX = Math.max(maxX - minX, 1);
+  const rangeY = Math.max(maxY - minY, 1);
+
+  return rooms.map(r => {
+    const l  = r.pixel_left   ?? 0;
+    const t  = r.pixel_top    ?? 0;
+    const ri = r.pixel_right  ?? (l + 50);
+    const b  = r.pixel_bottom ?? (t + 50);
+    return {
+      ...r,
+      position: {
+        x: (l  - minX) / rangeX,
+        y: (t  - minY) / rangeY,
+      },
+      size: {
+        w: (ri - l) / rangeX,
+        h: (b  - t) / rangeY,
+      }
+    };
+  });
+}
+
+/* ─── Check overlap ─── */
 function overlaps(a, b) {
   const ax1=a.position.x, ay1=a.position.y, ax2=ax1+a.size.w, ay2=ay1+a.size.h;
   const bx1=b.position.x, by1=b.position.y, bx2=bx1+b.size.w, by2=by1+b.size.h;
   return ax1<bx2-0.01 && ax2>bx1+0.01 && ay1<by2-0.01 && ay2>by1+0.01;
 }
 
-// Auto-fix overlaps by pushing rooms apart
-function fixOverlaps(rooms) {
-  const r = rooms.map(room => ({
-    ...room,
-    position: { ...room.position },
-    size: { ...room.size }
-  }));
-
-  // Sort top-left first
-  r.sort((a, b) => {
-    const ay = Math.round(a.position.y * 10), by2 = Math.round(b.position.y * 10);
-    return ay !== by2 ? ay - by2 : a.position.x - b.position.x;
-  });
-
-  let changed = true;
-  let passes = 0;
-  while (changed && passes < 10) {
-    changed = false;
-    passes++;
-    for (let i = 0; i < r.length; i++) {
-      for (let j = i + 1; j < r.length; j++) {
-        if (!overlaps(r[i], r[j])) continue;
-        const a = r[i], b = r[j];
-        const ax1=a.position.x, ay1=a.position.y, ax2=ax1+a.size.w, ay2=ay1+a.size.h;
-        const bx1=b.position.x, by1=b.position.y, bx2=bx1+b.size.w, by2=by1+b.size.h;
-        const ow = Math.min(ax2, bx2) - Math.max(ax1, bx1);
-        const oh = Math.min(ay2, by2) - Math.max(ay1, by1);
-        // Push in direction of smaller overlap
-        if (ow <= oh) {
-          // Push b to the right of a
-          r[j].position.x = ax2;
-        } else {
-          // Push b below a
-          r[j].position.y = ay2;
-        }
-        changed = true;
-      }
-    }
-  }
-  return r;
-}
-
+/* ─── Room colours ─── */
 function getRoomColor(name) {
   const n = (name || "").toLowerCase();
-  if (n.includes("main bed") || n.includes("master"))   return { fill: "#0a1828", stroke: "#1a6bb5", text: "#b0d8f8", label: "#6ab8f0" };
-  if (n.includes("bed") || n.includes("bedroom"))       return { fill: "#0a1e30", stroke: "#2980b9", text: "#a8d8f0", label: "#7ec8e3" };
-  if (n.includes("lounge") || n.includes("living"))     return { fill: "#0a1e0a", stroke: "#27ae60", text: "#a8e6c0", label: "#6dd5a0" };
-  if (n.includes("dining"))                              return { fill: "#081a08", stroke: "#2ecc71", text: "#a0e0b8", label: "#60c890" };
-  if (n.includes("kitchen"))                             return { fill: "#1e1000", stroke: "#e67e22", text: "#ffd9a8", label: "#f0a060" };
-  if (n.includes("bath"))                                return { fill: "#0a0a22", stroke: "#9b59b6", text: "#d8b4f8", label: "#b07dd8" };
-  if (n.includes("wc") || n.includes("toilet"))         return { fill: "#0a0a1a", stroke: "#8e44ad", text: "#d0a8f0", label: "#a060d0" };
-  if (n.includes("garage") || n.includes("carport"))    return { fill: "#101010", stroke: "#7f8c8d", text: "#c0c0c0", label: "#a0a0a0" };
-  if (n.includes("verandah") || n.includes("balcony") || n.includes("entertaining") || n.includes("covered")) return { fill: "#001814", stroke: "#16a085", text: "#a0e0d8", label: "#50c0b0" };
-  if (n.includes("entry") || n.includes("hall"))        return { fill: "#181200", stroke: "#d4ac0d", text: "#f8e8a0", label: "#e0c840" };
-  if (n.includes("linen") || n.includes("robe") || n.includes("store") || n.includes("laundry") || n.includes("l'dry")) return { fill: "#100808", stroke: "#c0392b", text: "#f8c0c0", label: "#e08888" };
-  return { fill: "#0e0e1e", stroke: "#5555aa", text: "#c0c0e8", label: "#8080c8" };
+  if (n.includes("main bed") || n.includes("master"))        return { fill:"#0a1828", stroke:"#1a6bb5", text:"#b0d8f8", label:"#6ab8f0" };
+  if (n.includes("bed") || n.includes("bedroom"))            return { fill:"#0a1e30", stroke:"#2980b9", text:"#a8d8f0", label:"#7ec8e3" };
+  if (n.includes("lounge") || n.includes("living"))          return { fill:"#0a1e0a", stroke:"#27ae60", text:"#a8e6c0", label:"#6dd5a0" };
+  if (n.includes("dining"))                                   return { fill:"#081a08", stroke:"#2ecc71", text:"#a0e0b8", label:"#60c890" };
+  if (n.includes("kitchen"))                                  return { fill:"#1e1000", stroke:"#e67e22", text:"#ffd9a8", label:"#f0a060" };
+  if (n.includes("bath"))                                     return { fill:"#0a0a22", stroke:"#9b59b6", text:"#d8b4f8", label:"#b07dd8" };
+  if (n.includes("wc") || n.includes("toilet"))              return { fill:"#0a0a1a", stroke:"#8e44ad", text:"#d0a8f0", label:"#a060d0" };
+  if (n.includes("garage") || n.includes("carport"))         return { fill:"#101010", stroke:"#7f8c8d", text:"#c0c0c0", label:"#a0a0a0" };
+  if (n.includes("verandah") || n.includes("balcony") || n.includes("entertaining") || n.includes("covered")) return { fill:"#001814", stroke:"#16a085", text:"#a0e0d8", label:"#50c0b0" };
+  if (n.includes("entry") || n.includes("hall"))             return { fill:"#181200", stroke:"#d4ac0d", text:"#f8e8a0", label:"#e0c840" };
+  if (n.includes("linen") || n.includes("robe") || n.includes("store") || n.includes("laundry") || n.includes("l'dry")) return { fill:"#100808", stroke:"#c0392b", text:"#f8c0c0", label:"#e08888" };
+  return { fill:"#0e0e1e", stroke:"#5555aa", text:"#c0c0e8", label:"#8080c8" };
 }
 
 export default function App() {
@@ -120,11 +115,11 @@ export default function App() {
     setError(null); setLogs([]); setResult(null); setSelected(null); setOverlapList([]);
     setImgURL(URL.createObjectURL(file));
     addLog(`File: ${file.name} | ${Math.round(file.size/1024)}KB`);
-    setProgress("Compressing image…");
+    setProgress("Compressing…");
     try {
       const data = await compressImage(file, 900, 0.85);
       setImgData(data);
-      addLog(`Ready: ${data.w}×${data.h}px | ~${data.kb}KB`);
+      addLog(`Compressed: ${data.w}×${data.h}px | ~${data.kb}KB`);
       setProgress("");
       setPage("analysing");
     } catch (e) {
@@ -145,44 +140,45 @@ export default function App() {
   const analyse = useCallback(async (imgInfo) => {
     if (!imgInfo) return;
     setError(null); setResult(null); setOverlapList([]);
-    setProgress("AI is reading floor plan…");
-    addLog(`Sending ${imgInfo.kb}KB`);
+    setProgress("AI reading pixel coordinates…");
+    addLog(`Sending ${imgInfo.kb}KB  (${imgInfo.w}×${imgInfo.h}px)`);
+
     try {
       const resp = await fetch("/api/analyse", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageB64: imgInfo.b64 })
+        body: JSON.stringify({ imageB64: imgInfo.b64, imgW: imgInfo.w, imgH: imgInfo.h })
       });
       addLog(`HTTP ${resp.status}`);
       const respData = await resp.json();
       if (respData.error) throw new Error(respData.error);
       addLog(`Reply: ${respData.text?.slice(0, 150)}`);
-      setProgress("Checking layout…");
 
+      setProgress("Converting pixel coords to layout…");
       const parsed = extractJSON(respData.text);
-      if (!Array.isArray(parsed.rooms) || !parsed.rooms.length) throw new Error("No rooms found in response");
+      if (!Array.isArray(parsed.rooms) || !parsed.rooms.length) throw new Error("No rooms found");
 
-      // Find overlaps before fix
-      const before = [];
+      // Convert pixel coords → normalised fractions
+      const iW = parsed.imageWidth  || imgInfo.w;
+      const iH = parsed.imageHeight || imgInfo.h;
+      addLog(`Image dimensions used: ${iW}×${iH}`);
+
+      parsed.rooms = normaliseRooms(parsed.rooms, iW, iH);
+
+      // Log positions for debugging
+      parsed.rooms.forEach(r => {
+        addLog(`${r.name}: x=${r.position.x.toFixed(2)} y=${r.position.y.toFixed(2)} w=${r.size.w.toFixed(2)} h=${r.size.h.toFixed(2)}`);
+      });
+
+      // Check remaining overlaps
+      const ov = [];
       for (let i=0;i<parsed.rooms.length;i++)
         for (let j=i+1;j<parsed.rooms.length;j++)
           if (overlaps(parsed.rooms[i],parsed.rooms[j]))
-            before.push(`${parsed.rooms[i].name} ↔ ${parsed.rooms[j].name}`);
+            ov.push(`${parsed.rooms[i].name} ↔ ${parsed.rooms[j].name}`);
+      setOverlapList(ov);
+      addLog(`Overlaps: ${ov.length}`);
 
-      addLog(`Overlaps before fix: ${before.length}`);
-      if (before.length > 0) {
-        parsed.rooms = fixOverlaps(parsed.rooms);
-        addLog(`Auto-fixed overlap positions`);
-      }
-
-      // Find remaining overlaps
-      const after = [];
-      for (let i=0;i<parsed.rooms.length;i++)
-        for (let j=i+1;j<parsed.rooms.length;j++)
-          if (overlaps(parsed.rooms[i],parsed.rooms[j]))
-            after.push(`${parsed.rooms[i].name} ↔ ${parsed.rooms[j].name}`);
-
-      setOverlapList(after);
       parsed.totalAreaM2 = Math.round(
         parsed.rooms.reduce((s,r) => s+(r.widthM||0)*(r.lengthM||0), 0)*100
       )/100;
@@ -215,7 +211,7 @@ export default function App() {
       {/* BAR */}
       <div style={S.bar}>
         <div onClick={reset} style={S.brand}>
-          <span style={{ fontSize:22, color:"#4CAF50" }}>▦</span>
+          <span style={{ fontSize:22,color:"#4CAF50" }}>▦</span>
           <div>
             <div style={S.bname}>CARPET<span style={{ color:"#4CAF50" }}>FLOOR</span>PLAN</div>
             <div style={S.bsub}>Ceaser Home · Auto Measure</div>
@@ -227,11 +223,11 @@ export default function App() {
       {/* HOME */}
       {page==="home" && (
         <div style={S.page}>
-          <div style={{ textAlign:"center", marginBottom:28 }}>
+          <div style={{ textAlign:"center",marginBottom:28 }}>
             <div style={S.h1}>Floor Plan Measurer</div>
-            <div style={S.h2}>Upload any floor plan → AI maps every room with correct positions and measurements</div>
-            <div style={{ marginTop:10, display:"flex", justifyContent:"center", gap:10, flexWrap:"wrap" }}>
-              {["📐 Measurements","🚪 Doors","🪟 Windows","✅ No overlaps","📍 Correct positions"].map(b=>(
+            <div style={S.h2}>Upload any floor plan photo → AI reads pixel positions and maps every room accurately</div>
+            <div style={{ marginTop:10,display:"flex",justifyContent:"center",gap:10,flexWrap:"wrap" }}>
+              {["📐 Measurements","🚪 Doors","🪟 Windows","📍 Pixel-accurate positions"].map(b=>(
                 <div key={b} style={S.badge}>{b}</div>
               ))}
             </div>
@@ -240,31 +236,27 @@ export default function App() {
           <div style={S.uploadBox}
             onDragOver={e=>e.preventDefault()}
             onDrop={e=>{e.preventDefault();processFile(e.dataTransfer.files[0]);}}>
-
             <label htmlFor="pick" style={S.bigBtn}>
               <span style={{ fontSize:36 }}>📐</span>
               <div><div style={S.bLabel}>Upload Floor Plan</div><div style={S.bSub}>Photo · Screenshot · Scan</div></div>
             </label>
             <input id="pick" type="file" accept="image/*" style={S.gone}
               onChange={e=>{if(e.target.files[0])processFile(e.target.files[0]);e.target.value="";}}/>
-
             <div style={S.orRow}><div style={S.orLine}/><span style={S.orTxt}>OR</span><div style={S.orLine}/></div>
-
             <label htmlFor="cam" style={{...S.bigBtn,background:"#040d18",borderColor:"#183560"}}>
               <span style={{ fontSize:36 }}>📷</span>
               <div><div style={{...S.bLabel,color:"#5aacdc"}}>Take Photo</div><div style={S.bSub}>Point at floor plan</div></div>
             </label>
             <input id="cam" type="file" accept="image/*" capture="environment" style={S.gone}
               onChange={e=>{if(e.target.files[0])processFile(e.target.files[0]);e.target.value="";}}/>
-
-            <div style={{ fontSize:11, color:"#141440", textAlign:"center" }}>or drag & drop · paste Ctrl+V</div>
+            <div style={{ fontSize:11,color:"#141440",textAlign:"center" }}>or drag & drop · paste Ctrl+V</div>
           </div>
 
           <div style={S.howTo}>
             <div style={S.howToTitle}>OPTIONAL: MARK DOORS &amp; WINDOWS</div>
-            <div style={S.howToStep}><span style={S.stepN}>1</span>Draw yellow lines over door/window openings on the plan</div>
-            <div style={S.howToStep}><span style={S.stepN}>2</span>Upload the marked plan photo</div>
-            <div style={S.howToStep}><span style={S.stepN}>3</span>AI detects rooms + all yellow openings automatically</div>
+            <div style={S.howToStep}><span style={S.stepN}>1</span>Draw yellow lines over door and window openings</div>
+            <div style={S.howToStep}><span style={S.stepN}>2</span>Upload the marked plan</div>
+            <div style={S.howToStep}><span style={S.stepN}>3</span>AI detects rooms and all openings</div>
           </div>
         </div>
       )}
@@ -276,8 +268,8 @@ export default function App() {
             {imgURL && <img src={imgURL} alt="plan" style={S.analysingImg}/>}
             <div style={S.analysingOverlay}>
               <div style={S.spinnerWrap}><div style={S.spinnerRing}/><span style={{ fontSize:26,color:"#4CAF50" }}>▦</span></div>
-              <div style={{ fontSize:17,fontWeight:700,color:"#4CAF50",marginTop:4 }}>{progress||"Analysing…"}</div>
-              <div style={{ fontSize:12,color:"#2a5a2a",marginTop:6 }}>Mapping rooms with correct x/y positions</div>
+              <div style={{ fontSize:17,fontWeight:700,color:"#4CAF50",marginTop:4 }}>{progress||"Reading pixel positions…"}</div>
+              <div style={{ fontSize:12,color:"#2a5a2a",marginTop:6 }}>AI maps room walls from pixel coordinates</div>
             </div>
           </div>
         </div>
@@ -286,7 +278,7 @@ export default function App() {
       {/* ERROR */}
       {page==="error" && (
         <div style={S.page}>
-          {imgURL && <img src={imgURL} alt="plan" style={{ width:"100%",borderRadius:10,marginBottom:16,opacity:0.4 }}/>}
+          {imgURL&&<img src={imgURL} alt="plan" style={{ width:"100%",borderRadius:10,marginBottom:16,opacity:0.4 }}/>}
           <div style={S.errBox}>
             <div style={S.errTitle}>⚠ {error}</div>
             {logs.map((l,i)=><div key={i} style={S.logLine}>{l}</div>)}
@@ -308,16 +300,8 @@ export default function App() {
 
           {overlapList.length>0 && (
             <div style={S.warnBox}>
-              <div style={{ fontWeight:700,marginBottom:4 }}>⚠ {overlapList.length} position issue{overlapList.length>1?"s":""} (auto-corrected)</div>
-              {overlapList.map((o,i)=><div key={i} style={{ fontSize:11,marginTop:2,opacity:0.8 }}>{o}</div>)}
-            </div>
-          )}
-
-          {/* Layout rows display */}
-          {result.layoutRows?.length > 0 && (
-            <div style={S.rowsCard}>
-              <div style={S.rowsTitle}>DETECTED LAYOUT</div>
-              {result.layoutRows.map((r,i)=><div key={i} style={S.rowItem}>{r}</div>)}
+              ⚠ {overlapList.length} layout issue{overlapList.length>1?"s":""} detected
+              {overlapList.map((o,i)=><div key={i} style={{ fontSize:11,marginTop:2 }}>{o}</div>)}
             </div>
           )}
 
@@ -339,7 +323,7 @@ export default function App() {
           {tab==="plan" && (
             <div>
               <BlueprintPlan rooms={result.rooms} hover={hover} setHover={setHover} selected={selected} setSelected={setSelected}/>
-              {selected!==null && result.rooms[selected] && (
+              {selected!==null&&result.rooms[selected]&&(
                 <RoomDetail room={result.rooms[selected]} onClose={()=>setSelected(null)}/>
               )}
               <div style={{ marginTop:12,display:"flex",flexDirection:"column",gap:4 }}>
@@ -367,7 +351,7 @@ export default function App() {
               <div style={S.legendRow}>
                 <div style={S.li}><span style={{...S.ldot,background:"#FFD700"}}/>Door</div>
                 <div style={S.li}><span style={{...S.ldot,background:"#60a8e0"}}/>Window</div>
-                <div style={S.li}><span style={{...S.ldot,background:"#4CAF50"}}/>Labelled dim.</div>
+                <div style={S.li}><span style={{...S.ldot,background:"#4CAF50"}}/>Labelled</div>
                 <div style={S.li}><span style={{...S.ldot,background:"#666"}}/>~ Scaled</div>
               </div>
             </div>
@@ -386,7 +370,8 @@ export default function App() {
                   const d=r.openings?.filter(o=>o.type==="door").length||0;
                   const w=r.openings?.filter(o=>o.type==="window").length||0;
                   return (
-                    <div key={i} style={{ display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr",borderBottom:"1px solid #0a0a1a",background:hover===i?"#141430":i%2===0?"#080818":"#0b0b1e",cursor:"pointer" }}
+                    <div key={i} style={{ display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr",borderBottom:"1px solid #0a0a1a",
+                      background:hover===i?"#141430":i%2===0?"#080818":"#0b0b1e",cursor:"pointer" }}
                       onMouseEnter={()=>setHover(i)} onMouseLeave={()=>setHover(null)}>
                       <div style={{ padding:"10px 8px",fontSize:13,display:"flex",alignItems:"center",gap:6,color:c.label }}>
                         <span style={{ width:8,height:8,borderRadius:2,background:c.stroke,flexShrink:0 }}/>{r.name}
@@ -410,27 +395,29 @@ export default function App() {
               <div style={{ marginTop:14,background:"#060e06",border:"1px solid #183018",borderLeft:"4px solid #4CAF50",borderRadius:10,padding:"13px 16px" }}>
                 <div style={{ fontSize:9,letterSpacing:3,color:"#4CAF50",marginBottom:5 }}>SCALE</div>
                 <div style={{ fontSize:16,fontWeight:700,color:"#d0e8d0",marginBottom:5 }}>{result.scale?.ratio||"—"}</div>
-                {result.scale?.references?.map((r,i)=><div key={i} style={{ fontSize:11,color:"#306030",marginTop:3 }}>· {r}</div>)}
+                {result.scale?.references?.map((ref,i)=><div key={i} style={{ fontSize:11,color:"#306030",marginTop:3 }}>· {ref}</div>)}
               </div>
             </div>
           )}
 
           {tab==="info" && (
             <div style={{ display:"flex",flexDirection:"column",gap:14 }}>
-              {result.layoutRows?.length>0 && (
-                <div>
-                  <div style={S.iHead}>LAYOUT ROWS (from AI)</div>
-                  {result.layoutRows.map((r,i)=>(
-                    <div key={i} style={{ padding:"8px 12px",background:"#060610",border:"1px solid #101030",borderRadius:7,marginTop:6,fontSize:12,color:"#5060a0" }}>{r}</div>
-                  ))}
-                </div>
-              )}
               <div>
-                <div style={S.iHead}>DEBUG LOG</div>
+                <div style={S.iHead}>PIXEL COORDINATE LOG</div>
                 <div style={{ background:"#030308",border:"1px solid #0c0c28",borderRadius:8,padding:12 }}>
                   {logs.map((l,i)=><div key={i} style={S.logLine}>{l}</div>)}
                 </div>
               </div>
+              {result.sanityFlags?.filter(Boolean).length>0 && (
+                <div>
+                  <div style={S.iHead}>SANITY FLAGS</div>
+                  {result.sanityFlags.filter(Boolean).map((f,i)=>(
+                    <div key={i} style={{ padding:"9px 12px",background:"#060610",border:"1px solid #101030",borderRadius:7,marginTop:6,fontSize:12,color:"#5060a0" }}>
+                      <span style={{ color:"#4CAF50",marginRight:8 }}>✓</span>{f}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -444,30 +431,19 @@ export default function App() {
   );
 }
 
-/* ══ BLUEPRINT SVG RENDERER ══ */
+/* ══ BLUEPRINT SVG — renders from normalised 0-1 position/size ══ */
 function BlueprintPlan({ rooms, hover, setHover, selected, setSelected }) {
-  const W=440, H=400, PAD=24;
+  const W=440, H=420, PAD=20;
   const aW=W-PAD*2, aH=H-PAD*2;
-  const WALL=3.5;
+  const WALL=3;
 
-  // Compute bounding box
-  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity;
-  rooms.forEach(r=>{
-    const x=r.position?.x??0, y=r.position?.y??0;
-    const w=r.size?.w??0.2,   h=r.size?.h??0.2;
-    if(x<minX)minX=x; if(y<minY)minY=y;
-    if(x+w>maxX)maxX=x+w; if(y+h>maxY)maxY=y+h;
-  });
-  if(!isFinite(minX)){minX=0;minY=0;maxX=1;maxY=1;}
-  const rX=Math.max(maxX-minX,0.05), rY=Math.max(maxY-minY,0.05);
+  // Rooms already normalised — position.x/y and size.w/h are fractions 0-1
+  // x=0 is LEFT, x=1 is RIGHT, y=0 is TOP, y=1 is BOTTOM
+  const toSVGx = fx => PAD + fx * aW;
+  const toSVGy = fy => PAD + fy * aH;
+  const toSVGw = fw => fw * aW;
+  const toSVGh = fh => fh * aH;
 
-  // CORRECT mapping: x→horizontal, y→vertical
-  const toSVGx = fx => PAD + ((fx-minX)/rX)*aW;  // larger x = more RIGHT
-  const toSVGy = fy => PAD + ((fy-minY)/rY)*aH;  // larger y = more DOWN
-  const toSVGw = fw => (fw/rX)*aW;
-  const toSVGh = fh => (fh/rY)*aH;
-
-  // Overlap set
   const ovSet=new Set();
   for(let i=0;i<rooms.length;i++)
     for(let j=i+1;j<rooms.length;j++)
@@ -480,7 +456,7 @@ function BlueprintPlan({ rooms, hover, setHover, selected, setSelected }) {
     const segs=[];
     let cur=0;
     rel.forEach((op,oi)=>{
-      const s=Math.min(op.posStart??0,op.posEnd??1), e=Math.max(op.posStart??0,op.posEnd??1);
+      const s=Math.min(op.posStart??0,op.posEnd??1),e=Math.max(op.posStart??0,op.posEnd??1);
       if(s>cur) segs.push(<line key={`b${oi}`} x1={x1+(x2-x1)*cur} y1={y1+(y2-y1)*cur} x2={x1+(x2-x1)*s} y2={y1+(y2-y1)*s} stroke={stroke} strokeWidth={sw} strokeLinecap="square"/>);
       const sx=x1+(x2-x1)*s,sy=y1+(y2-y1)*s,ex=x1+(x2-x1)*e,ey=y1+(y2-y1)*e;
       const gl=wlen*(e-s);
@@ -509,6 +485,7 @@ function BlueprintPlan({ rooms, hover, setHover, selected, setSelected }) {
         <span style={{ fontSize:9,color:"#1a5a8a",letterSpacing:2 }}>FLOOR PLAN</span>
         <span style={{ fontSize:8,color:"#FFD700" }}>■ door</span>
         <span style={{ fontSize:8,color:"#60a8e0" }}>■ window</span>
+        {ovSet.size>0&&<span style={{ fontSize:8,color:"#ff6060" }}>⚠ overlap</span>}
         <span style={{ fontSize:8,color:"#0e2840",marginLeft:"auto" }}>tap room</span>
       </div>
       <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display:"block" }}>
@@ -520,26 +497,19 @@ function BlueprintPlan({ rooms, hover, setHover, selected, setSelected }) {
         </defs>
         <rect width={W} height={H} fill="#02060c"/>
         <rect width={W} height={H} fill="url(#bp)"/>
-        <rect x={PAD-4} y={PAD-4} width={aW+8} height={aH+8} fill="none" stroke="#0a2030" strokeWidth="1" strokeDasharray="5 4"/>
-
-        {/* X axis label */}
-        <text x={PAD} y={H-4} fill="#0e2840" style={{ fontSize:7,fontFamily:"monospace" }}>x: LEFT→RIGHT</text>
-        <text x={W-8} y={H-4} textAnchor="end" fill="#0e2840" style={{ fontSize:7,fontFamily:"monospace" }}>y: TOP↓BOTTOM</text>
+        <rect x={PAD-3} y={PAD-3} width={aW+6} height={aH+6} fill="none" stroke="#0a2030" strokeWidth="1" strokeDasharray="4 4"/>
 
         {rooms.map((room,i)=>{
           const c=getRoomColor(room.name);
           const on=hover===i||selected===i;
           const bad=ovSet.has(i);
-          const px=room.position?.x??0, py=room.position?.y??0;
-          const pw=room.size?.w??0.2,   ph=room.size?.h??0.2;
-
-          // Map to SVG: x is horizontal (left→right), y is vertical (top→bottom)
-          const rx=toSVGx(px), ry=toSVGy(py);
-          const rw=Math.max(28,toSVGw(pw));
-          const rh=Math.max(20,toSVGh(ph));
+          const rx=toSVGx(room.position?.x??0);
+          const ry=toSVGy(room.position?.y??0);
+          const rw=Math.max(24,toSVGw(room.size?.w??0.15));
+          const rh=Math.max(18,toSVGh(room.size?.h??0.12));
           const sc=room.dimensionSource==="scaled";
           const ops=room.openings||[];
-          const nfs=Math.min(10,Math.max(6,rw/8));
+          const nfs=Math.min(10,Math.max(5,rw/8));
           const dfs=Math.min(8, Math.max(5,rw/10));
           const afs=Math.min(9, Math.max(5,rw/9));
 
@@ -549,25 +519,26 @@ function BlueprintPlan({ rooms, hover, setHover, selected, setSelected }) {
               onClick={()=>setSelected(selected===i?null:i)}>
               <rect x={rx} y={ry} width={rw} height={rh} fill={c.fill} opacity={on?1:0.88} filter={on?"url(#glow)":""}/>
               <rect x={rx} y={ry} width={rw} height={2.5} fill={c.stroke} opacity="0.5"/>
-              <WallSeg x1={rx}    y1={ry}    x2={rx+rw} y2={ry}    wall="north" ops={ops} stroke={bad?"#ff4444":c.stroke} sw={on?WALL+1:WALL}/>
-              <WallSeg x1={rx}    y1={ry+rh} x2={rx+rw} y2={ry+rh} wall="south" ops={ops} stroke={bad?"#ff4444":c.stroke} sw={on?WALL+1:WALL}/>
-              <WallSeg x1={rx}    y1={ry}    x2={rx}    y2={ry+rh} wall="west"  ops={ops} stroke={bad?"#ff4444":c.stroke} sw={on?WALL+1:WALL}/>
-              <WallSeg x1={rx+rw} y1={ry}    x2={rx+rw} y2={ry+rh} wall="east"  ops={ops} stroke={bad?"#ff4444":c.stroke} sw={on?WALL+1:WALL}/>
-              {rh>18 && <text x={rx+rw/2} y={ry+rh/2-(rh>40?7:0)} textAnchor="middle" fill={c.text} style={{ fontSize:nfs,fontWeight:700,fontFamily:"sans-serif" }}>{room.name}</text>}
-              {rh>36 && <text x={rx+rw/2} y={ry+rh/2+4} textAnchor="middle" fill={c.text} opacity="0.6" style={{ fontSize:dfs,fontFamily:"monospace" }}>{sc?"~":""}{room.widthM}×{sc?"~":""}{room.lengthM}m</text>}
-              {rh>50 && <text x={rx+rw/2} y={ry+rh/2+14} textAnchor="middle" fill={c.stroke} style={{ fontSize:afs,fontWeight:700,fontFamily:"monospace" }}>{(room.widthM*room.lengthM).toFixed(2)}m²</text>}
-              {sc && <text x={rx+rw-3} y={ry+9} textAnchor="end" fill="#888" style={{ fontSize:6 }}>~</text>}
-              {bad && <text x={rx+4} y={ry+9} fill="#ff4444" style={{ fontSize:6 }}>⚠</text>}
+              <WallSeg x1={rx} y1={ry} x2={rx+rw} y2={ry} wall="north" ops={ops} stroke={bad?"#ff4444":c.stroke} sw={on?WALL+1:WALL}/>
+              <WallSeg x1={rx} y1={ry+rh} x2={rx+rw} y2={ry+rh} wall="south" ops={ops} stroke={bad?"#ff4444":c.stroke} sw={on?WALL+1:WALL}/>
+              <WallSeg x1={rx} y1={ry} x2={rx} y2={ry+rh} wall="west" ops={ops} stroke={bad?"#ff4444":c.stroke} sw={on?WALL+1:WALL}/>
+              <WallSeg x1={rx+rw} y1={ry} x2={rx+rw} y2={ry+rh} wall="east" ops={ops} stroke={bad?"#ff4444":c.stroke} sw={on?WALL+1:WALL}/>
+              {rh>16&&<text x={rx+rw/2} y={ry+rh/2-(rh>38?7:0)} textAnchor="middle" fill={c.text} style={{ fontSize:nfs,fontWeight:700,fontFamily:"sans-serif" }}>{room.name}</text>}
+              {rh>34&&<text x={rx+rw/2} y={ry+rh/2+4} textAnchor="middle" fill={c.text} opacity="0.6" style={{ fontSize:dfs,fontFamily:"monospace" }}>{sc?"~":""}{room.widthM}×{sc?"~":""}{room.lengthM}m</text>}
+              {rh>50&&<text x={rx+rw/2} y={ry+rh/2+15} textAnchor="middle" fill={c.stroke} style={{ fontSize:afs,fontWeight:700,fontFamily:"monospace" }}>{(room.widthM*room.lengthM).toFixed(2)}m²</text>}
+              {sc&&<text x={rx+rw-2} y={ry+9} textAnchor="end" fill="#888" style={{ fontSize:6 }}>~</text>}
+              {bad&&<text x={rx+3} y={ry+9} fill="#ff4444" style={{ fontSize:6 }}>⚠</text>}
             </g>
           );
         })}
+        <text x={PAD} y={H-5} fill="#0e2840" style={{ fontSize:7,fontFamily:"monospace" }}>pixel coords: left→right / top→bottom</text>
       </svg>
     </div>
   );
 }
 
 function RoomDetail({ room, onClose }) {
-  const c=getRoomColor(room.name), sc=room.dimensionSource==="scaled";
+  const c=getRoomColor(room.name),sc=room.dimensionSource==="scaled";
   const doors=room.openings?.filter(o=>o.type==="door")||[];
   const wins =room.openings?.filter(o=>o.type==="window")||[];
   return (
@@ -580,68 +551,65 @@ function RoomDetail({ room, onClose }) {
         <div><div style={{ fontSize:8,color:c.text,opacity:0.5 }}>LENGTH</div><div style={{ fontSize:18,fontWeight:700,color:c.text }}>{sc?"~":""}{room.lengthM}m</div></div>
         <div><div style={{ fontSize:8,color:c.text,opacity:0.5 }}>AREA</div><div style={{ fontSize:18,fontWeight:700,color:c.stroke }}>{(room.widthM*room.lengthM).toFixed(2)}m²</div></div>
       </div>
-      {doors.length>0 && <div style={{ marginBottom:8 }}>
-        <div style={{ fontSize:8,color:"#FFD700",letterSpacing:2,marginBottom:3 }}>🚪 DOORS</div>
-        {doors.map((d,i)=><div key={i} style={{ fontSize:11,color:"#c8a820",marginTop:2 }}>{d.wall} wall · {d.widthM||"~"}m · pos {Math.round((d.posStart||0)*100)}%–{Math.round((d.posEnd||1)*100)}%</div>)}
-      </div>}
-      {wins.length>0 && <div>
-        <div style={{ fontSize:8,color:"#60a8e0",letterSpacing:2,marginBottom:3 }}>🪟 WINDOWS</div>
-        {wins.map((w,i)=><div key={i} style={{ fontSize:11,color:"#4090c0",marginTop:2 }}>{w.wall} wall · {w.widthM||"~"}m · pos {Math.round((w.posStart||0)*100)}%–{Math.round((w.posEnd||1)*100)}%</div>)}
-      </div>}
-      {!doors.length&&!wins.length && <div style={{ fontSize:11,color:c.text,opacity:0.4 }}>No marked openings</div>}
-      <div style={{ marginTop:8,fontSize:9,color:c.text,opacity:0.4 }}>
-        Position: x={room.position?.x?.toFixed(3)} y={room.position?.y?.toFixed(3)} | Size: w={room.size?.w?.toFixed(3)} h={room.size?.h?.toFixed(3)}
+      <div style={{ fontSize:9,color:c.text,opacity:0.4,marginBottom:8 }}>
+        Pixels: left={room.pixel_left} top={room.pixel_top} right={room.pixel_right} bottom={room.pixel_bottom}
       </div>
+      {doors.length>0&&<div style={{ marginBottom:8 }}>
+        <div style={{ fontSize:8,color:"#FFD700",letterSpacing:2,marginBottom:3 }}>🚪 DOORS</div>
+        {doors.map((d,i)=><div key={i} style={{ fontSize:11,color:"#c8a820",marginTop:2 }}>{d.wall} wall · {d.widthM||"~"}m · {Math.round((d.posStart||0)*100)}%–{Math.round((d.posEnd||1)*100)}%</div>)}
+      </div>}
+      {wins.length>0&&<div>
+        <div style={{ fontSize:8,color:"#60a8e0",letterSpacing:2,marginBottom:3 }}>🪟 WINDOWS</div>
+        {wins.map((w,i)=><div key={i} style={{ fontSize:11,color:"#4090c0",marginTop:2 }}>{w.wall} wall · {w.widthM||"~"}m · {Math.round((w.posStart||0)*100)}%–{Math.round((w.posEnd||1)*100)}%</div>)}
+      </div>}
+      {!doors.length&&!wins.length&&<div style={{ fontSize:11,color:c.text,opacity:0.4 }}>No marked openings</div>}
     </div>
   );
 }
 
 const S={
-  shell:     {minHeight:"100vh",background:"#020208",color:"#e0e0f0",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",display:"flex",flexDirection:"column"},
-  bar:       {display:"flex",alignItems:"center",gap:12,padding:"12px 18px",background:"#040410",borderBottom:"1px solid #0e0e38",flexWrap:"wrap"},
-  brand:     {display:"flex",alignItems:"center",gap:10,cursor:"pointer"},
-  bname:     {fontSize:14,fontWeight:900,letterSpacing:2},
-  bsub:      {fontSize:8,color:"#181840",letterSpacing:2},
-  newBtn:    {marginLeft:"auto",background:"#4CAF50",color:"#000",border:"none",borderRadius:8,padding:"8px 16px",fontSize:13,fontWeight:700,cursor:"pointer"},
-  page:      {flex:1,padding:"20px 16px",maxWidth:680,margin:"0 auto",width:"100%",boxSizing:"border-box"},
-  h1:        {fontSize:24,fontWeight:900,color:"#c0c0e0",marginBottom:8},
-  h2:        {fontSize:13,color:"#303060",lineHeight:1.6},
-  badge:     {fontSize:11,color:"#4CAF50",background:"#081408",border:"1px solid #204820",borderRadius:20,padding:"4px 10px"},
-  uploadBox: {background:"#040410",border:"2px dashed #141440",borderRadius:16,padding:"26px 20px",display:"flex",flexDirection:"column",alignItems:"center",gap:14},
-  bigBtn:    {display:"flex",alignItems:"center",justifyContent:"center",gap:14,background:"#081408",border:"2px solid #204820",borderRadius:14,padding:"15px 26px",cursor:"pointer",width:"100%",maxWidth:340,boxSizing:"border-box"},
-  bLabel:    {fontSize:16,fontWeight:700,color:"#4CAF50",letterSpacing:1},
-  bSub:      {fontSize:11,color:"#2a4a2a",marginTop:2},
-  gone:      {position:"absolute",opacity:0,width:0,height:0,pointerEvents:"none"},
-  orRow:     {display:"flex",alignItems:"center",gap:12,width:"100%",maxWidth:340},
-  orLine:    {flex:1,height:1,background:"#0e0e38"},
-  orTxt:     {fontSize:9,color:"#141440",letterSpacing:2},
-  howTo:     {marginTop:22,background:"#040410",border:"1px solid #0e0e38",borderRadius:12,padding:"16px"},
-  howToTitle:{fontSize:9,letterSpacing:3,color:"#4CAF50",marginBottom:10},
-  howToStep: {display:"flex",alignItems:"flex-start",gap:10,marginBottom:8,fontSize:12,color:"#4060a0",lineHeight:1.5},
-  stepN:     {width:22,height:22,borderRadius:"50%",background:"#0a200a",border:"1px solid #204820",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:"#4CAF50",flexShrink:0},
+  shell:      {minHeight:"100vh",background:"#020208",color:"#e0e0f0",fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",display:"flex",flexDirection:"column"},
+  bar:        {display:"flex",alignItems:"center",gap:12,padding:"12px 18px",background:"#040410",borderBottom:"1px solid #0e0e38",flexWrap:"wrap"},
+  brand:      {display:"flex",alignItems:"center",gap:10,cursor:"pointer"},
+  bname:      {fontSize:14,fontWeight:900,letterSpacing:2},
+  bsub:       {fontSize:8,color:"#181840",letterSpacing:2},
+  newBtn:     {marginLeft:"auto",background:"#4CAF50",color:"#000",border:"none",borderRadius:8,padding:"8px 16px",fontSize:13,fontWeight:700,cursor:"pointer"},
+  page:       {flex:1,padding:"20px 16px",maxWidth:680,margin:"0 auto",width:"100%",boxSizing:"border-box"},
+  h1:         {fontSize:24,fontWeight:900,color:"#c0c0e0",marginBottom:8},
+  h2:         {fontSize:13,color:"#303060",lineHeight:1.6},
+  badge:      {fontSize:11,color:"#4CAF50",background:"#081408",border:"1px solid #204820",borderRadius:20,padding:"4px 10px"},
+  uploadBox:  {background:"#040410",border:"2px dashed #141440",borderRadius:16,padding:"26px 20px",display:"flex",flexDirection:"column",alignItems:"center",gap:14},
+  bigBtn:     {display:"flex",alignItems:"center",justifyContent:"center",gap:14,background:"#081408",border:"2px solid #204820",borderRadius:14,padding:"15px 26px",cursor:"pointer",width:"100%",maxWidth:340,boxSizing:"border-box"},
+  bLabel:     {fontSize:16,fontWeight:700,color:"#4CAF50",letterSpacing:1},
+  bSub:       {fontSize:11,color:"#2a4a2a",marginTop:2},
+  gone:       {position:"absolute",opacity:0,width:0,height:0,pointerEvents:"none"},
+  orRow:      {display:"flex",alignItems:"center",gap:12,width:"100%",maxWidth:340},
+  orLine:     {flex:1,height:1,background:"#0e0e38"},
+  orTxt:      {fontSize:9,color:"#141440",letterSpacing:2},
+  howTo:      {marginTop:22,background:"#040410",border:"1px solid #0e0e38",borderRadius:12,padding:"16px"},
+  howToTitle: {fontSize:9,letterSpacing:3,color:"#4CAF50",marginBottom:10},
+  howToStep:  {display:"flex",alignItems:"flex-start",gap:10,marginBottom:8,fontSize:12,color:"#4060a0",lineHeight:1.5},
+  stepN:      {width:22,height:22,borderRadius:"50%",background:"#0a200a",border:"1px solid #204820",display:"flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,color:"#4CAF50",flexShrink:0},
   analysingWrap:{position:"relative",borderRadius:14,overflow:"hidden",background:"#040410",border:"1px solid #0e0e38",minHeight:260},
   analysingImg: {width:"100%",display:"block",opacity:0.3},
   analysingOverlay:{position:"absolute",top:0,left:0,right:0,bottom:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"},
   spinnerWrap:{position:"relative",width:54,height:54,display:"flex",alignItems:"center",justifyContent:"center",marginBottom:10},
   spinnerRing:{position:"absolute",width:54,height:54,borderRadius:"50%",border:"3px solid transparent",borderTop:"3px solid #4CAF50",animation:"spin 1s linear infinite"},
-  warnBox:   {background:"#1a0808",border:"1px solid #4a1010",borderRadius:10,padding:"12px 16px",marginBottom:14,fontSize:12,color:"#e08080"},
-  rowsCard:  {background:"#040a04",border:"1px solid #0e280e",borderRadius:10,padding:"12px 16px",marginBottom:14},
-  rowsTitle: {fontSize:9,letterSpacing:3,color:"#4CAF50",marginBottom:8},
-  rowItem:   {fontSize:11,color:"#3a6a3a",marginTop:4},
-  summary:   {display:"flex",gap:14,padding:"12px 16px",background:"#040410",borderRadius:14,marginBottom:16,alignItems:"center",flexWrap:"wrap",border:"1px solid #0e0e38"},
-  sLabel:    {fontSize:8,letterSpacing:3,color:"#1a1a50",marginBottom:2},
-  sBig:      {fontSize:26,fontWeight:900,color:"#4CAF50"},
-  tabRow:    {display:"flex",borderBottom:"2px solid #0c0c30",marginBottom:16},
-  tabBtn:    {flex:1,padding:"10px 4px",background:"transparent",border:"none",color:"#1a1a48",fontSize:12,fontWeight:700,cursor:"pointer",letterSpacing:1,borderBottom:"2px solid transparent",marginBottom:-2},
-  tabOn:     {color:"#4CAF50",borderBottom:"2px solid #4CAF50"},
-  td:        {padding:"10px 8px",fontSize:13,textAlign:"right",color:"#505090"},
-  iHead:     {fontSize:9,letterSpacing:3,color:"#4CAF50",fontWeight:700,marginBottom:6},
-  errBox:    {background:"#0c0303",border:"1px solid #300c0c",borderRadius:10,padding:"14px 16px"},
-  errTitle:  {color:"#ff6060",fontWeight:700,fontSize:14,marginBottom:8},
-  logLine:   {fontSize:10,color:"#502020",wordBreak:"break-all",marginTop:3,lineHeight:1.4},
-  tagD:      {fontSize:10,background:"#181200",color:"#FFD700",border:"1px solid #302000",borderRadius:6,padding:"2px 5px"},
-  tagW:      {fontSize:10,background:"#081020",color:"#60a8e0",border:"1px solid #103040",borderRadius:6,padding:"2px 5px"},
-  legendRow: {display:"flex",flexWrap:"wrap",gap:10,marginTop:12,padding:"9px 12px",background:"#040410",border:"1px solid #0e0e38",borderRadius:8},
-  li:        {display:"flex",alignItems:"center",gap:6,fontSize:10,color:"#404070"},
-  ldot:      {width:10,height:10,borderRadius:2,flexShrink:0},
+  warnBox:    {background:"#1a0808",border:"1px solid #4a1010",borderRadius:10,padding:"12px 16px",marginBottom:14,fontSize:12,color:"#e08080",fontWeight:700},
+  summary:    {display:"flex",gap:14,padding:"12px 16px",background:"#040410",borderRadius:14,marginBottom:16,alignItems:"center",flexWrap:"wrap",border:"1px solid #0e0e38"},
+  sLabel:     {fontSize:8,letterSpacing:3,color:"#1a1a50",marginBottom:2},
+  sBig:       {fontSize:26,fontWeight:900,color:"#4CAF50"},
+  tabRow:     {display:"flex",borderBottom:"2px solid #0c0c30",marginBottom:16},
+  tabBtn:     {flex:1,padding:"10px 4px",background:"transparent",border:"none",color:"#1a1a48",fontSize:12,fontWeight:700,cursor:"pointer",letterSpacing:1,borderBottom:"2px solid transparent",marginBottom:-2},
+  tabOn:      {color:"#4CAF50",borderBottom:"2px solid #4CAF50"},
+  td:         {padding:"10px 8px",fontSize:13,textAlign:"right",color:"#505090"},
+  iHead:      {fontSize:9,letterSpacing:3,color:"#4CAF50",fontWeight:700,marginBottom:6},
+  errBox:     {background:"#0c0303",border:"1px solid #300c0c",borderRadius:10,padding:"14px 16px"},
+  errTitle:   {color:"#ff6060",fontWeight:700,fontSize:14,marginBottom:8},
+  logLine:    {fontSize:10,color:"#502020",wordBreak:"break-all",marginTop:3,lineHeight:1.4},
+  tagD:       {fontSize:10,background:"#181200",color:"#FFD700",border:"1px solid #302000",borderRadius:6,padding:"2px 5px"},
+  tagW:       {fontSize:10,background:"#081020",color:"#60a8e0",border:"1px solid #103040",borderRadius:6,padding:"2px 5px"},
+  legendRow:  {display:"flex",flexWrap:"wrap",gap:10,marginTop:12,padding:"9px 12px",background:"#040410",border:"1px solid #0e0e38",borderRadius:8},
+  li:         {display:"flex",alignItems:"center",gap:6,fontSize:10,color:"#404070"},
+  ldot:       {width:10,height:10,borderRadius:2,flexShrink:0},
 };
