@@ -162,7 +162,7 @@ export default function FloorPlanAnalyzer() {
       const base64 = image.split(',')[1]
       const mediaType = image.split(';')[0].split(':')[1]
 
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
+      const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
