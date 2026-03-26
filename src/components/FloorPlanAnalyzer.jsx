@@ -1,0 +1,661 @@
+import { useState, useRef, useCallback, useEffect } from 'react'
+import './FloorPlanAnalyzer.css'
+
+const MODEL = 'claude-sonnet-4-20250514'
+
+const ANALYSIS_PROMPT = `You are an expert floor plan analyzer with perfect spatial reasoning.
+
+CRITICAL FIRST STEP — CROP TO ACTUAL FLOOR PLAN:
+Many floor plan photos have large black or white borders/padding around the actual drawing.
+Before measuring ANYTHING, identify the bounding box of the actual floor plan drawing itself.
+ALL pixel coordinates you return must be relative to the TOP-LEFT CORNER OF THE FULL IMAGE (0,0 = top-left pixel of the uploaded image).
+Do NOT re-number coordinates after mentally cropping — use full image pixel coordinates throughout.
+
+YOUR TASKS:
+
+1. CALIBRATION
+   - Find all labeled rooms with written dimensions (e.g. "3x4m", "5 x 6m", "2.8 x 3.6m")
+   - Pick the LARGEST clearly labeled room for best accuracy (more pixels = more precise ratio)
+   - Carefully measure that room's SHORT wall in pixels in the full image
+   - pixels_per_meter = short_side_pixels / short_side_label_m
+   - Double-check: does the long side = long_side_label_m x pixels_per_meter? Adjust if not.
+
+2. DOOR DETECTION — distinguish each type carefully:
+   A. SWING DOOR: gap in wall PLUS a quarter-circle arc. Arc pivots from one end of the gap.
+      - arc_center_x/y = the hinge point (one end of the gap, full image coords)
+      - arc_radius_px = gap width in pixels (= door panel length)
+      - arc_start_deg / arc_end_deg = angular sweep (e.g. 0->90, 90->180, 180->270, 270->360)
+      - wall_orientation: "horizontal" if wall runs left-right, "vertical" if wall runs top-bottom
+   B. OPEN PASSAGE: gap in wall with NO arc. Wardrobe entries, open archways.
+   C. SLIDING or BIFOLD: gap with parallel lines. Often balcony/patio access.
+   D. WINDOW: gap in EXTERIOR (outer perimeter) wall with double-line sill. NOT a door.
+
+3. WALL MEASUREMENTS
+   - Measure every wall of every room in pixels, convert to meters using calibration
+   - Gaps (doors/windows) are INCLUDED in total wall length
+   - All bounding_box coordinates are full image pixel coordinates
+
+Return ONLY valid JSON — no markdown, no backticks, no explanation, nothing before or after the JSON:
+
+{
+  "calibration": {
+    "reference_room": "Living",
+    "label_text": "5 x 6m",
+    "short_side_label_m": 5,
+    "long_side_label_m": 6,
+    "short_side_pixels": 280,
+    "long_side_pixels": 336,
+    "pixels_per_meter": 56.0,
+    "confidence": "high"
+  },
+  "floorplan_bounds": {
+    "x": 60, "y": 420, "w": 550, "h": 650,
+    "note": "Actual floor plan drawing region in the full image"
+  },
+  "rooms": [
+    {
+      "name": "Living",
+      "label": "5 x 6m",
+      "bounding_box": { "x": 190, "y": 580, "w": 280, "h": 336 },
+      "walls": [
+        { "side": "north", "length_px": 280, "length_m": 5.0, "has_door": true,  "has_window": false },
+        { "side": "east",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": false },
+        { "side": "south", "length_px": 280, "length_m": 5.0, "has_door": false, "has_window": false },
+        { "side": "west",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": true  }
+      ]
+    }
+  ],
+  "doors": [
+    {
+      "id": "D1",
+      "type": "swing",
+      "wall_orientation": "horizontal",
+      "location": "Bed 2 south wall into corridor",
+      "gap_x": 120,
+      "gap_y": 490,
+      "gap_width_px": 52,
+      "gap_width_m": 0.93,
+      "arc_center_x": 120,
+      "arc_center_y": 490,
+      "arc_radius_px": 52,
+      "arc_start_deg": 0,
+      "arc_end_deg": 90,
+      "connects": ["Bed 2", "Corridor"]
+    }
+  ],
+  "passages": [
+    {
+      "id": "P1",
+      "wall_orientation": "horizontal",
+      "location": "Robe entry from Bed 2",
+      "gap_x": 90,
+      "gap_y": 520,
+      "gap_width_px": 40,
+      "gap_width_m": 0.71,
+      "connects": ["Bed 2", "Robe"]
+    }
+  ],
+  "windows": [
+    {
+      "id": "W1",
+      "location": "North exterior wall of Bed 1",
+      "wall_orientation": "horizontal",
+      "center_x": 395,
+      "center_y": 418,
+      "width_px": 60,
+      "width_m": 1.07
+    }
+  ],
+  "summary": "Calibrated via Living (5x6m = 280x336px = 56px/m). Found 5 swing doors, 3 open passages, 4 windows."
+}`
+
+export default function FloorPlanAnalyzer() {
+  const [image, setImage] = useState(null)
+  const [imageNaturalSize, setImageNaturalSize] = useState({ w: 1, h: 1 })
+  const [analysis, setAnalysis] = useState(null)
+  const [loading, setLoading] = useState(false)
+  const [loadingStep, setLoadingStep] = useState('')
+  const [error, setError] = useState(null)
+  const [activeTab, setActiveTab] = useState('doors')
+  const [hoveredId, setHoveredId] = useState(null)
+  const [showDimensions, setShowDimensions] = useState(true)
+  const [showDoors, setShowDoors] = useState(true)
+  const [showWindows, setShowWindows] = useState(true)
+  const [showPassages, setShowPassages] = useState(true)
+  const [imgReady, setImgReady] = useState(false)
+
+  const fileInputRef = useRef(null)
+  const canvasRef = useRef(null)
+  const imgRef = useRef(null)
+
+  const handleFile = useCallback((file) => {
+    if (!file || !file.type.startsWith('image/')) return
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const src = e.target.result
+      const img = new Image()
+      img.onload = () => {
+        setImageNaturalSize({ w: img.width, h: img.height })
+        setImage(src)
+        setAnalysis(null)
+        setError(null)
+        setImgReady(false)
+      }
+      img.src = src
+    }
+    reader.readAsDataURL(file)
+  }, [])
+
+  const handleDrop = useCallback((e) => {
+    e.preventDefault()
+    handleFile(e.dataTransfer.files[0])
+  }, [handleFile])
+
+  const analyze = async () => {
+    if (!image) return
+    setLoading(true)
+    setError(null)
+    setAnalysis(null)
+
+    try {
+      setLoadingStep('Sending image to AI…')
+      const base64 = image.split(',')[1]
+      const mediaType = image.split(';')[0].split(':')[1]
+
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: 4000,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+              { type: 'text', text: ANALYSIS_PROMPT }
+            ]
+          }]
+        })
+      })
+
+      setLoadingStep('Parsing results…')
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error?.message || 'API error')
+
+      const raw = data.content.map(b => b.text || '').join('')
+      const clean = raw.replace(/```json|```/g, '').trim()
+      const parsed = JSON.parse(clean)
+
+      // Bug 6 fix: validate calibration before accepting
+      if (!parsed.calibration?.pixels_per_meter || parsed.calibration.pixels_per_meter <= 0) {
+        throw new Error(
+          'AI could not determine a valid pixel-to-meter calibration. ' +
+          'Try a higher-resolution image or ensure the floor plan has labeled room dimensions (e.g. "5 x 6m").'
+        )
+      }
+
+      setAnalysis(parsed)
+      setActiveTab('doors')
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+      setLoadingStep('')
+    }
+  }
+
+  // Bug 7 fix: only draw after image is confirmed painted in DOM
+  useEffect(() => {
+    if (!analysis || !imgReady) return
+    drawOverlay()
+  }, [analysis, showDimensions, showDoors, showWindows, showPassages, hoveredId, imgReady])
+
+  // Bug 7 fix: mark image ready after load event fires
+  const onImgLoad = () => {
+    setImgReady(true)
+  }
+
+  const drawOverlay = () => {
+    const canvas = canvasRef.current
+    const img = imgRef.current
+    if (!canvas || !img) return
+
+    const dW = img.offsetWidth
+    const dH = img.offsetHeight
+    if (!dW || !dH) return  // image not yet painted
+
+    canvas.width = dW
+    canvas.height = dH
+
+    const natW = imageNaturalSize.w
+    const natH = imageNaturalSize.h
+    const scX = dW / natW
+    const scY = dH / natH
+
+    const ctx = canvas.getContext('2d')
+    ctx.clearRect(0, 0, dW, dH)
+
+    const px = x => x * scX
+    const py = y => y * scY
+
+    const { doors = [], passages = [], windows = [], rooms = [] } = analysis
+
+    // ── Dimension overlays ───────────────────────────────────────────────
+    if (showDimensions && rooms.length > 0) {
+      rooms.forEach(room => {
+        const bb = room.bounding_box
+        if (!bb) return
+        const isHov = hoveredId === room.name
+
+        ctx.strokeStyle = isHov ? '#378ADD' : '#378ADD66'
+        ctx.lineWidth = isHov ? 2 : 1
+        ctx.setLineDash([6, 4])
+        ctx.strokeRect(px(bb.x), py(bb.y), px(bb.w), py(bb.h))
+        ctx.setLineDash([])
+
+        room.walls?.forEach(wall => {
+          if (!wall.length_m || isNaN(wall.length_m)) return
+          const lbl = wall.length_m.toFixed(1) + 'm'
+          let tx, ty
+          if      (wall.side === 'north') { tx = px(bb.x + bb.w / 2); ty = py(bb.y) - 12 }
+          else if (wall.side === 'south') { tx = px(bb.x + bb.w / 2); ty = py(bb.y + bb.h) + 12 }
+          else if (wall.side === 'west')  { tx = px(bb.x) - 20; ty = py(bb.y + bb.h / 2) }
+          else                            { tx = px(bb.x + bb.w) + 20; ty = py(bb.y + bb.h / 2) }
+
+          const tw = lbl.length * 6.5 + 10
+          ctx.fillStyle = isHov ? '#0C447C' : '#185FA5'
+          ctx.beginPath()
+          ctx.roundRect(tx - tw / 2, ty - 9, tw, 18, 3)
+          ctx.fill()
+          ctx.fillStyle = '#fff'
+          ctx.font = `${isHov ? '600' : '500'} 11px sans-serif`
+          ctx.textAlign = 'center'
+          ctx.textBaseline = 'middle'
+          ctx.fillText(lbl, tx, ty)
+        })
+      })
+    }
+
+    // ── Doors ────────────────────────────────────────────────────────────
+    if (showDoors) {
+      doors.forEach(door => {
+        const isHov = hoveredId === door.id
+        const isVert = door.wall_orientation === 'vertical'
+
+        // Bug 2 fix: use average scale so arc stays circular
+        const avgScale = (scX + scY) / 2
+        const arcCx = px(door.arc_center_x)
+        const arcCy = py(door.arc_center_y)
+        const arcR  = door.arc_radius_px * avgScale
+        const startRad = (door.arc_start_deg ?? 0)  * Math.PI / 180
+        const endRad   = (door.arc_end_deg   ?? 90) * Math.PI / 180
+
+        ctx.strokeStyle = isHov ? '#E24B4A' : '#E24B4Acc'
+        ctx.lineWidth = isHov ? 3 : 2.5
+        ctx.setLineDash([5, 3])
+        ctx.beginPath()
+        ctx.arc(arcCx, arcCy, arcR, startRad, endRad)
+        ctx.stroke()
+        ctx.setLineDash([])
+
+        // Bug 4 fix: gap bracket direction respects wall_orientation
+        ctx.strokeStyle = isHov ? '#E24B4A' : '#E24B4Acc'
+        ctx.lineWidth = isHov ? 4 : 3
+        const gx1 = px(door.gap_x)
+        const gy1 = py(door.gap_y)
+        const gx2 = isVert ? px(door.gap_x)                    : px(door.gap_x + door.gap_width_px)
+        const gy2 = isVert ? py(door.gap_y + door.gap_width_px): py(door.gap_y)
+
+        ctx.beginPath()
+        if (isVert) {
+          ctx.moveTo(gx1 - 4, gy1); ctx.lineTo(gx1 + 4, gy1)
+          ctx.moveTo(gx2 - 4, gy2); ctx.lineTo(gx2 + 4, gy2)
+        } else {
+          ctx.moveTo(gx1, gy1 - 4); ctx.lineTo(gx1, gy1 + 4)
+          ctx.moveTo(gx2, gy2 - 4); ctx.lineTo(gx2, gy2 + 4)
+        }
+        ctx.stroke()
+
+        const lx = (gx1 + gx2) / 2
+        const ly = (gy1 + gy2) / 2 - 14
+        const lbl = door.id
+        const tw = lbl.length * 7 + 10
+        ctx.fillStyle = isHov ? '#A32D2D' : '#E24B4A'
+        ctx.beginPath()
+        ctx.roundRect(lx - tw / 2, ly - 9, tw, 18, 4)
+        ctx.fill()
+        ctx.fillStyle = '#fff'
+        ctx.font = 'bold 11px sans-serif'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(lbl, lx, ly)
+      })
+    }
+
+    // ── Passages ─────────────────────────────────────────────────────────
+    if (showPassages) {
+      passages.forEach(p => {
+        const isHov = hoveredId === p.id
+        const isVert = p.wall_orientation === 'vertical'
+
+        ctx.strokeStyle = isHov ? '#1D9E75' : '#1D9E7599'
+        ctx.lineWidth = isHov ? 3 : 2
+        ctx.setLineDash([4, 3])
+        const gx1 = px(p.gap_x)
+        const gy1 = py(p.gap_y)
+        const gx2 = isVert ? px(p.gap_x)                   : px(p.gap_x + p.gap_width_px)
+        const gy2 = isVert ? py(p.gap_y + p.gap_width_px)  : py(p.gap_y)
+
+        ctx.beginPath()
+        ctx.moveTo(gx1, gy1)
+        ctx.lineTo(gx2, gy2)
+        ctx.stroke()
+        ctx.setLineDash([])
+
+        const lx = (gx1 + gx2) / 2
+        const ly = (gy1 + gy2) / 2 - 14
+        const lbl = p.id
+        const tw = lbl.length * 7 + 10
+        ctx.fillStyle = isHov ? '#0F6E56' : '#1D9E75'
+        ctx.beginPath()
+        ctx.roundRect(lx - tw / 2, ly - 9, tw, 18, 4)
+        ctx.fill()
+        ctx.fillStyle = '#fff'
+        ctx.font = 'bold 11px sans-serif'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(lbl, lx, ly)
+      })
+    }
+
+    // ── Windows ───────────────────────────────────────────────────────────
+    if (showWindows) {
+      windows.forEach(w => {
+        const isHov = hoveredId === w.id
+        const isVert = w.wall_orientation === 'vertical'
+        const cx = px(w.center_x)
+        const cy = py(w.center_y)
+        const halfW = px(w.width_px) / 2
+
+        ctx.strokeStyle = isHov ? '#BA7517' : '#BA751799'
+        ctx.lineWidth = isHov ? 4 : 3
+        ctx.beginPath()
+        if (isVert) {
+          ctx.moveTo(cx, cy - halfW); ctx.lineTo(cx, cy + halfW)
+          ctx.moveTo(cx - 5, cy - halfW); ctx.lineTo(cx + 5, cy - halfW)
+          ctx.moveTo(cx - 5, cy + halfW); ctx.lineTo(cx + 5, cy + halfW)
+        } else {
+          ctx.moveTo(cx - halfW, cy); ctx.lineTo(cx + halfW, cy)
+          ctx.moveTo(cx - halfW, cy - 5); ctx.lineTo(cx - halfW, cy + 5)
+          ctx.moveTo(cx + halfW, cy - 5); ctx.lineTo(cx + halfW, cy + 5)
+        }
+        ctx.stroke()
+
+        const lbl = w.id
+        const tw = lbl.length * 7 + 10
+        const labelY = isVert ? cy : cy - 16
+        ctx.fillStyle = isHov ? '#854F0B' : '#BA7517'
+        ctx.beginPath()
+        ctx.roundRect(cx - tw / 2, labelY - 9, tw, 16, 3)
+        ctx.fill()
+        ctx.fillStyle = '#fff'
+        ctx.font = 'bold 10px sans-serif'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(lbl, cx, labelY)
+      })
+    }
+  }
+
+  const cal      = analysis?.calibration
+  const doors    = analysis?.doors    || []
+  const passages = analysis?.passages || []
+  const windows  = analysis?.windows  || []
+  const rooms    = analysis?.rooms    || []
+
+  return (
+    <div className="fpa-root">
+      <header className="fpa-header">
+        <div className="fpa-logo">
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+            <rect x="1"  y="1"  width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+            <rect x="11" y="1"  width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+            <rect x="1"  y="11" width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+            <rect x="11" y="11" width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+          </svg>
+          CarpetPlan
+        </div>
+        <span className="fpa-badge">Floor Plan Analyzer</span>
+      </header>
+
+      <main className="fpa-main">
+        <div className="fpa-left">
+          {!image ? (
+            <div
+              className="fpa-dropzone"
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={e => e.preventDefault()}
+              onDrop={handleDrop}
+            >
+              <input ref={fileInputRef} type="file" accept="image/*" onChange={e => handleFile(e.target.files[0])} />
+              <div className="fpa-drop-icon">
+                <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                  <rect x="4" y="6" width="24" height="20" rx="2" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+                  <path d="M4 12h24" stroke="currentColor" strokeWidth="1.5"/>
+                  <path d="M10 9h.01M13 9h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+                  <path d="M16 20v-6M13 17l3-3 3 3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                </svg>
+              </div>
+              <p className="fpa-drop-title">Drop your floor plan here</p>
+              <p className="fpa-drop-sub">or click to browse · PNG, JPG, WEBP</p>
+            </div>
+          ) : (
+            <div className="fpa-canvas-area">
+              <div className="fpa-toggles">
+                <button className={`fpa-toggle ${showDimensions ? 'on blue' : ''}`}  onClick={() => setShowDimensions(v => !v)}>
+                  <span className="tog-dot"></span> Dimensions
+                </button>
+                <button className={`fpa-toggle ${showDoors    ? 'on red'  : ''}`}  onClick={() => setShowDoors(v => !v)}>
+                  <span className="tog-dot"></span> Doors
+                </button>
+                <button className={`fpa-toggle ${showPassages ? 'on green': ''}`}  onClick={() => setShowPassages(v => !v)}>
+                  <span className="tog-dot"></span> Passages
+                </button>
+                <button className={`fpa-toggle ${showWindows  ? 'on amber': ''}`}  onClick={() => setShowWindows(v => !v)}>
+                  <span className="tog-dot"></span> Windows
+                </button>
+                <button className="fpa-toggle reset" onClick={() => {
+                  setImage(null); setAnalysis(null); setError(null); setImgReady(false)
+                }}>
+                  Clear
+                </button>
+              </div>
+
+              <div className="fpa-img-wrap">
+                <img
+                  ref={imgRef}
+                  src={image}
+                  alt="Floor plan"
+                  className="fpa-img"
+                  onLoad={onImgLoad}
+                />
+                <canvas ref={canvasRef} className="fpa-overlay" />
+              </div>
+            </div>
+          )}
+
+          {/* Bug 3 fix: always show when image loaded, label changes to Re-analyze */}
+          {image && (
+            <button className="fpa-analyze-btn" onClick={analyze} disabled={loading}>
+              {loading ? (
+                <><span className="spin"></span>{loadingStep}</>
+              ) : (
+                <>
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                    <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5"/>
+                    <path d="M8 5v3l2 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                  </svg>
+                  {analysis ? 'Re-analyze' : 'Analyze Floor Plan'}
+                </>
+              )}
+            </button>
+          )}
+
+          {error && (
+            <div className="fpa-error">
+              <strong>Analysis failed:</strong> {error}
+            </div>
+          )}
+        </div>
+
+        {analysis && (
+          <div className="fpa-right">
+            {cal && (
+              <div className="fpa-cal-card">
+                <div className="fpa-cal-label">Calibration</div>
+                <div className="fpa-cal-row">
+                  <span className="cal-room">{cal.reference_room}</span>
+                  <span className="cal-eq">{cal.label_text}</span>
+                  <span className="cal-px">{cal.pixels_per_meter?.toFixed(1)} px/m</span>
+                </div>
+                <div className={`fpa-cal-conf ${cal.confidence}`}>{cal.confidence} confidence</div>
+              </div>
+            )}
+
+            <div className="fpa-tabs">
+              {[
+                { id: 'doors',    label: `Doors (${doors.length})`,       color: 'red'   },
+                { id: 'passages', label: `Passages (${passages.length})`, color: 'green' },
+                { id: 'windows',  label: `Windows (${windows.length})`,   color: 'amber' },
+                { id: 'rooms',    label: `Rooms (${rooms.length})`,       color: 'blue'  },
+              ].map(t => (
+                <button
+                  key={t.id}
+                  className={`fpa-tab ${activeTab === t.id ? 'active ' + t.color : ''}`}
+                  onClick={() => setActiveTab(t.id)}
+                >{t.label}</button>
+              ))}
+            </div>
+
+            <div className="fpa-panel">
+              {activeTab === 'doors' && (
+                <div className="fpa-list">
+                  {doors.length === 0 && <p className="fpa-empty">No swing doors detected</p>}
+                  {doors.map(d => (
+                    <div
+                      key={d.id}
+                      className={`fpa-item door ${hoveredId === d.id ? 'hov' : ''}`}
+                      onMouseEnter={() => setHoveredId(d.id)}
+                      onMouseLeave={() => setHoveredId(null)}
+                    >
+                      <div className="fpa-item-head">
+                        <span className="fpa-item-id red">{d.id}</span>
+                        <span className="fpa-item-type">{d.type === 'swing' ? 'Swing door' : d.type}</span>
+                        <span className="fpa-item-dim">{d.gap_width_m?.toFixed(2)}m</span>
+                      </div>
+                      <div className="fpa-item-loc">{d.location}</div>
+                      <div className="fpa-item-meta">
+                        {d.connects?.join(' → ')}
+                        {d.wall_orientation && <span className="fpa-chip">{d.wall_orientation}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeTab === 'passages' && (
+                <div className="fpa-list">
+                  {passages.length === 0 && <p className="fpa-empty">No open passages detected</p>}
+                  {passages.map(p => (
+                    <div
+                      key={p.id}
+                      className={`fpa-item passage ${hoveredId === p.id ? 'hov' : ''}`}
+                      onMouseEnter={() => setHoveredId(p.id)}
+                      onMouseLeave={() => setHoveredId(null)}
+                    >
+                      <div className="fpa-item-head">
+                        <span className="fpa-item-id green">{p.id}</span>
+                        <span className="fpa-item-type">Open passage</span>
+                        <span className="fpa-item-dim">{p.gap_width_m?.toFixed(2)}m</span>
+                      </div>
+                      <div className="fpa-item-loc">{p.location}</div>
+                      <div className="fpa-item-meta">
+                        {p.connects?.join(' → ')}
+                        {p.wall_orientation && <span className="fpa-chip">{p.wall_orientation}</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeTab === 'windows' && (
+                <div className="fpa-list">
+                  {windows.length === 0 && <p className="fpa-empty">No windows detected</p>}
+                  {windows.map(w => (
+                    <div
+                      key={w.id}
+                      className={`fpa-item window ${hoveredId === w.id ? 'hov' : ''}`}
+                      onMouseEnter={() => setHoveredId(w.id)}
+                      onMouseLeave={() => setHoveredId(null)}
+                    >
+                      <div className="fpa-item-head">
+                        <span className="fpa-item-id amber">{w.id}</span>
+                        <span className="fpa-item-type">Window</span>
+                        <span className="fpa-item-dim">{w.width_m?.toFixed(2)}m</span>
+                      </div>
+                      <div className="fpa-item-loc">{w.location}</div>
+                      <div className="fpa-item-meta">{w.wall_orientation} wall</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {activeTab === 'rooms' && (
+                <div className="fpa-list">
+                  {rooms.length === 0 && <p className="fpa-empty">No rooms detected</p>}
+                  {rooms.map((r, i) => (
+                    <div
+                      key={i}
+                      className={`fpa-item room ${hoveredId === r.name ? 'hov' : ''}`}
+                      onMouseEnter={() => setHoveredId(r.name)}
+                      onMouseLeave={() => setHoveredId(null)}
+                    >
+                      <div className="fpa-item-head">
+                        <span className="fpa-item-id blue">{r.label || '—'}</span>
+                        <span className="fpa-item-type">{r.name}</span>
+                      </div>
+                      <table className="fpa-wall-table">
+                        <thead>
+                          <tr><th>Wall</th><th>Length</th><th>Flags</th></tr>
+                        </thead>
+                        <tbody>
+                          {r.walls?.map(w => (
+                            <tr key={w.side}>
+                              <td>{w.side}</td>
+                              <td>
+                                <strong>{isNaN(w.length_m) ? '?' : w.length_m?.toFixed(2)}m</strong>
+                                <span className="fpa-px"> ({Math.round(w.length_px || 0)}px)</span>
+                              </td>
+                              <td>
+                                {w.has_door   && <span className="fpa-flag red">door</span>}
+                                {w.has_window && <span className="fpa-flag amber">window</span>}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {analysis.summary && (
+              <div className="fpa-summary">{analysis.summary}</div>
+            )}
+          </div>
+        )}
+      </main>
+    </div>
+  )
+}
