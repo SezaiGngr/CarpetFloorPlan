@@ -1,4 +1,4 @@
-export default async (req, context) => {
+export default async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, {
       status: 204,
@@ -10,13 +10,8 @@ export default async (req, context) => {
     })
   }
 
-  if (req.method !== 'POST') {
-    return new Response('Method not allowed', { status: 405 })
-  }
-
   try {
     const body = await req.json()
-
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -26,9 +21,7 @@ export default async (req, context) => {
       },
       body: JSON.stringify(body)
     })
-
     const data = await response.json()
-
     return new Response(JSON.stringify(data), {
       status: response.status,
       headers: {
@@ -47,6 +40,4 @@ export default async (req, context) => {
   }
 }
 
-export const config = {
-  path: '/api/analyze'
-}
+export const config = { path: '/api/analyze' }
