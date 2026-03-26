@@ -2,29 +2,40 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import './FloorPlanAnalyzer.css'
 
 const MODEL = 'claude-sonnet-4-20250514'
-const MAX_IMG_WIDTH = 1000
 
-const ANALYSIS_PROMPT = `You are an expert floor plan analyzer. Analyze this floor plan image with extreme precision.
+const ANALYSIS_PROMPT = `You are an expert floor plan analyzer with perfect spatial reasoning.
+
+CRITICAL FIRST STEP — CROP TO ACTUAL FLOOR PLAN:
+Many floor plan photos have large black or white borders/padding around the actual drawing.
+Before measuring ANYTHING, identify the bounding box of the actual floor plan drawing itself.
+ALL pixel coordinates you return must be relative to the TOP-LEFT CORNER OF THE FULL IMAGE (0,0 = top-left pixel of the uploaded image).
+Do NOT re-number coordinates after mentally cropping — use full image pixel coordinates throughout.
 
 YOUR TASKS:
 
 1. CALIBRATION
-   - Find all rooms/spaces with written dimensions (e.g. "3x4m", "5 x 6m", "2.8 x 3.6m")
-   - Use the room whose SHORT side gives the most reliable pixel measurement
-   - Measure that short wall in pixels to get your pixels-per-meter ratio
+   - Find all labeled rooms with written dimensions (e.g. "3x4m", "5 x 6m", "2.8 x 3.6m")
+   - Pick the LARGEST clearly labeled room for best accuracy (more pixels = more precise ratio)
+   - Carefully measure that room's SHORT wall in pixels in the full image
+   - pixels_per_meter = short_side_pixels / short_side_label_m
+   - Double-check: does the long side = long_side_label_m x pixels_per_meter? Adjust if not.
 
-2. DOOR DETECTION (critical — distinguish these three types)
-   A. SWING DOOR: A gap in a wall PLUS a quarter-circle arc drawn from one end of the gap. The arc shows the door panel sweeping open. Most internal doors.
-   B. OPEN PASSAGE / ARCHWAY: A gap in a wall with NO arc. Just an opening, no door panel. E.g. wardrobe/robe entries, some connecting openings.
-   C. SLIDING DOOR or EXTERNAL DOOR: A gap with parallel lines or no arc. Often balcony/patio doors.
-   D. WINDOW: A gap in an EXTERIOR wall (outer perimeter) with a thin double-line or sill indication. NOT a door.
+2. DOOR DETECTION — distinguish each type carefully:
+   A. SWING DOOR: gap in wall PLUS a quarter-circle arc. Arc pivots from one end of the gap.
+      - arc_center_x/y = the hinge point (one end of the gap, full image coords)
+      - arc_radius_px = gap width in pixels (= door panel length)
+      - arc_start_deg / arc_end_deg = angular sweep (e.g. 0->90, 90->180, 180->270, 270->360)
+      - wall_orientation: "horizontal" if wall runs left-right, "vertical" if wall runs top-bottom
+   B. OPEN PASSAGE: gap in wall with NO arc. Wardrobe entries, open archways.
+   C. SLIDING or BIFOLD: gap with parallel lines. Often balcony/patio access.
+   D. WINDOW: gap in EXTERIOR (outer perimeter) wall with double-line sill. NOT a door.
 
 3. WALL MEASUREMENTS
-   - Measure every wall segment in pixels, convert to meters using calibration
-   - For walls with door/window gaps: measure the TOTAL span (gap included) as the full wall length
-   - Note where doors/windows interrupt each wall
+   - Measure every wall of every room in pixels, convert to meters using calibration
+   - Gaps (doors/windows) are INCLUDED in total wall length
+   - All bounding_box coordinates are full image pixel coordinates
 
-Return ONLY valid JSON (no markdown, no backticks, no explanation):
+Return ONLY valid JSON — no markdown, no backticks, no explanation, nothing before or after the JSON:
 
 {
   "calibration": {
@@ -37,16 +48,20 @@ Return ONLY valid JSON (no markdown, no backticks, no explanation):
     "pixels_per_meter": 56.0,
     "confidence": "high"
   },
+  "floorplan_bounds": {
+    "x": 60, "y": 420, "w": 550, "h": 650,
+    "note": "Actual floor plan drawing region in the full image"
+  },
   "rooms": [
     {
       "name": "Living",
       "label": "5 x 6m",
       "bounding_box": { "x": 190, "y": 580, "w": 280, "h": 336 },
       "walls": [
-        { "side": "north", "length_px": 280, "length_m": 5.0, "has_door": true, "has_window": false },
+        { "side": "north", "length_px": 280, "length_m": 5.0, "has_door": true,  "has_window": false },
         { "side": "east",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": false },
         { "side": "south", "length_px": 280, "length_m": 5.0, "has_door": false, "has_window": false },
-        { "side": "west",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": true }
+        { "side": "west",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": true  }
       ]
     }
   ],
@@ -54,13 +69,12 @@ Return ONLY valid JSON (no markdown, no backticks, no explanation):
     {
       "id": "D1",
       "type": "swing",
+      "wall_orientation": "horizontal",
       "location": "Bed 2 south wall into corridor",
       "gap_x": 120,
       "gap_y": 490,
       "gap_width_px": 52,
-      "gap_width_m": 0.9,
-      "swing_from": "left",
-      "swing_direction": "inward",
+      "gap_width_m": 0.93,
       "arc_center_x": 120,
       "arc_center_y": 490,
       "arc_radius_px": 52,
@@ -72,27 +86,27 @@ Return ONLY valid JSON (no markdown, no backticks, no explanation):
   "passages": [
     {
       "id": "P1",
-      "type": "open_passage",
+      "wall_orientation": "horizontal",
       "location": "Robe entry from Bed 2",
       "gap_x": 90,
       "gap_y": 520,
       "gap_width_px": 40,
-      "gap_width_m": 0.7,
+      "gap_width_m": 0.71,
       "connects": ["Bed 2", "Robe"]
     }
   ],
   "windows": [
     {
       "id": "W1",
-      "location": "North wall of Bed 1",
-      "wall_side": "north",
+      "location": "North exterior wall of Bed 1",
+      "wall_orientation": "horizontal",
       "center_x": 395,
       "center_y": 418,
       "width_px": 60,
       "width_m": 1.07
     }
   ],
-  "summary": "Found 7 swing doors, 3 open passages, 4 windows. Calibrated using Living room (5x6m = 280x336px → 56px/m)."
+  "summary": "Calibrated via Living (5x6m = 280x336px = 56px/m). Found 5 swing doors, 3 open passages, 4 windows."
 }`
 
 export default function FloorPlanAnalyzer() {
@@ -108,11 +122,11 @@ export default function FloorPlanAnalyzer() {
   const [showDoors, setShowDoors] = useState(true)
   const [showWindows, setShowWindows] = useState(true)
   const [showPassages, setShowPassages] = useState(true)
+  const [imgReady, setImgReady] = useState(false)
 
   const fileInputRef = useRef(null)
   const canvasRef = useRef(null)
   const imgRef = useRef(null)
-  const containerRef = useRef(null)
 
   const handleFile = useCallback((file) => {
     if (!file || !file.type.startsWith('image/')) return
@@ -125,6 +139,7 @@ export default function FloorPlanAnalyzer() {
         setImage(src)
         setAnalysis(null)
         setError(null)
+        setImgReady(false)
       }
       img.src = src
     }
@@ -170,6 +185,15 @@ export default function FloorPlanAnalyzer() {
       const raw = data.content.map(b => b.text || '').join('')
       const clean = raw.replace(/```json|```/g, '').trim()
       const parsed = JSON.parse(clean)
+
+      // Bug 6 fix: validate calibration before accepting
+      if (!parsed.calibration?.pixels_per_meter || parsed.calibration.pixels_per_meter <= 0) {
+        throw new Error(
+          'AI could not determine a valid pixel-to-meter calibration. ' +
+          'Try a higher-resolution image or ensure the floor plan has labeled room dimensions (e.g. "5 x 6m").'
+        )
+      }
+
       setAnalysis(parsed)
       setActiveTab('doors')
     } catch (err) {
@@ -180,10 +204,16 @@ export default function FloorPlanAnalyzer() {
     }
   }
 
+  // Bug 7 fix: only draw after image is confirmed painted in DOM
   useEffect(() => {
-    if (!analysis || !canvasRef.current || !imgRef.current) return
+    if (!analysis || !imgReady) return
     drawOverlay()
-  }, [analysis, showDimensions, showDoors, showWindows, showPassages, hoveredId])
+  }, [analysis, showDimensions, showDoors, showWindows, showPassages, hoveredId, imgReady])
+
+  // Bug 7 fix: mark image ready after load event fires
+  const onImgLoad = () => {
+    setImgReady(true)
+  }
 
   const drawOverlay = () => {
     const canvas = canvasRef.current
@@ -192,6 +222,8 @@ export default function FloorPlanAnalyzer() {
 
     const dW = img.offsetWidth
     const dH = img.offsetHeight
+    if (!dW || !dH) return  // image not yet painted
+
     canvas.width = dW
     canvas.height = dH
 
@@ -208,49 +240,55 @@ export default function FloorPlanAnalyzer() {
 
     const { doors = [], passages = [], windows = [], rooms = [] } = analysis
 
+    // ── Dimension overlays ───────────────────────────────────────────────
     if (showDimensions && rooms.length > 0) {
       rooms.forEach(room => {
         const bb = room.bounding_box
         if (!bb) return
         const isHov = hoveredId === room.name
-        ctx.strokeStyle = isHov ? '#378ADD' : '#378ADD55'
+
+        ctx.strokeStyle = isHov ? '#378ADD' : '#378ADD66'
         ctx.lineWidth = isHov ? 2 : 1
         ctx.setLineDash([6, 4])
         ctx.strokeRect(px(bb.x), py(bb.y), px(bb.w), py(bb.h))
         ctx.setLineDash([])
 
         room.walls?.forEach(wall => {
-          const lbl = wall.length_m?.toFixed(1) + 'm'
-          ctx.font = `${isHov ? 'bold ' : ''}11px sans-serif`
-          ctx.textAlign = 'center'
-          ctx.textBaseline = 'middle'
-
+          if (!wall.length_m || isNaN(wall.length_m)) return
+          const lbl = wall.length_m.toFixed(1) + 'm'
           let tx, ty
-          const side = wall.side
-          if (side === 'north') { tx = px(bb.x + bb.w / 2); ty = py(bb.y) - 10 }
-          else if (side === 'south') { tx = px(bb.x + bb.w / 2); ty = py(bb.y + bb.h) + 10 }
-          else if (side === 'west') { tx = px(bb.x) - 14; ty = py(bb.y + bb.h / 2) }
-          else { tx = px(bb.x + bb.w) + 14; ty = py(bb.y + bb.h / 2) }
+          if      (wall.side === 'north') { tx = px(bb.x + bb.w / 2); ty = py(bb.y) - 12 }
+          else if (wall.side === 'south') { tx = px(bb.x + bb.w / 2); ty = py(bb.y + bb.h) + 12 }
+          else if (wall.side === 'west')  { tx = px(bb.x) - 20; ty = py(bb.y + bb.h / 2) }
+          else                            { tx = px(bb.x + bb.w) + 20; ty = py(bb.y + bb.h / 2) }
 
-          const tw = lbl.length * 6.5 + 8
-          ctx.fillStyle = '#185FA5'
+          const tw = lbl.length * 6.5 + 10
+          ctx.fillStyle = isHov ? '#0C447C' : '#185FA5'
           ctx.beginPath()
-          ctx.roundRect(tx - tw / 2, ty - 8, tw, 16, 3)
+          ctx.roundRect(tx - tw / 2, ty - 9, tw, 18, 3)
           ctx.fill()
           ctx.fillStyle = '#fff'
+          ctx.font = `${isHov ? '600' : '500'} 11px sans-serif`
+          ctx.textAlign = 'center'
+          ctx.textBaseline = 'middle'
           ctx.fillText(lbl, tx, ty)
         })
       })
     }
 
+    // ── Doors ────────────────────────────────────────────────────────────
     if (showDoors) {
       doors.forEach(door => {
         const isHov = hoveredId === door.id
+        const isVert = door.wall_orientation === 'vertical'
+
+        // Bug 2 fix: use average scale so arc stays circular
+        const avgScale = (scX + scY) / 2
         const arcCx = px(door.arc_center_x)
         const arcCy = py(door.arc_center_y)
-        const arcR = px(door.arc_radius_px)
-        const startRad = (door.arc_start_deg || 0) * Math.PI / 180
-        const endRad = (door.arc_end_deg || 90) * Math.PI / 180
+        const arcR  = door.arc_radius_px * avgScale
+        const startRad = (door.arc_start_deg ?? 0)  * Math.PI / 180
+        const endRad   = (door.arc_end_deg   ?? 90) * Math.PI / 180
 
         ctx.strokeStyle = isHov ? '#E24B4A' : '#E24B4Acc'
         ctx.lineWidth = isHov ? 3 : 2.5
@@ -260,21 +298,26 @@ export default function FloorPlanAnalyzer() {
         ctx.stroke()
         ctx.setLineDash([])
 
+        // Bug 4 fix: gap bracket direction respects wall_orientation
         ctx.strokeStyle = isHov ? '#E24B4A' : '#E24B4Acc'
         ctx.lineWidth = isHov ? 4 : 3
         const gx1 = px(door.gap_x)
         const gy1 = py(door.gap_y)
-        const gx2 = px(door.gap_x + door.gap_width_px)
-        const gy2 = py(door.gap_y)
+        const gx2 = isVert ? px(door.gap_x)                    : px(door.gap_x + door.gap_width_px)
+        const gy2 = isVert ? py(door.gap_y + door.gap_width_px): py(door.gap_y)
+
         ctx.beginPath()
-        ctx.moveTo(gx1, gy1 - 3)
-        ctx.lineTo(gx1, gy1 + 3)
-        ctx.moveTo(gx2, gy2 - 3)
-        ctx.lineTo(gx2, gy2 + 3)
+        if (isVert) {
+          ctx.moveTo(gx1 - 4, gy1); ctx.lineTo(gx1 + 4, gy1)
+          ctx.moveTo(gx2 - 4, gy2); ctx.lineTo(gx2 + 4, gy2)
+        } else {
+          ctx.moveTo(gx1, gy1 - 4); ctx.lineTo(gx1, gy1 + 4)
+          ctx.moveTo(gx2, gy2 - 4); ctx.lineTo(gx2, gy2 + 4)
+        }
         ctx.stroke()
 
-        const lx = px(door.gap_x + door.gap_width_px / 2)
-        const ly = py(door.gap_y) - 14
+        const lx = (gx1 + gx2) / 2
+        const ly = (gy1 + gy2) / 2 - 14
         const lbl = door.id
         const tw = lbl.length * 7 + 10
         ctx.fillStyle = isHov ? '#A32D2D' : '#E24B4A'
@@ -289,23 +332,28 @@ export default function FloorPlanAnalyzer() {
       })
     }
 
+    // ── Passages ─────────────────────────────────────────────────────────
     if (showPassages) {
       passages.forEach(p => {
         const isHov = hoveredId === p.id
+        const isVert = p.wall_orientation === 'vertical'
+
         ctx.strokeStyle = isHov ? '#1D9E75' : '#1D9E7599'
         ctx.lineWidth = isHov ? 3 : 2
-        ctx.setLineDash([3, 3])
-        const gx = px(p.gap_x)
-        const gy = py(p.gap_y)
-        const gw = px(p.gap_width_px)
+        ctx.setLineDash([4, 3])
+        const gx1 = px(p.gap_x)
+        const gy1 = py(p.gap_y)
+        const gx2 = isVert ? px(p.gap_x)                   : px(p.gap_x + p.gap_width_px)
+        const gy2 = isVert ? py(p.gap_y + p.gap_width_px)  : py(p.gap_y)
+
         ctx.beginPath()
-        ctx.moveTo(gx, gy)
-        ctx.lineTo(gx + gw, gy)
+        ctx.moveTo(gx1, gy1)
+        ctx.lineTo(gx2, gy2)
         ctx.stroke()
         ctx.setLineDash([])
 
-        const lx = gx + gw / 2
-        const ly = gy - 14
+        const lx = (gx1 + gx2) / 2
+        const ly = (gy1 + gy2) / 2 - 14
         const lbl = p.id
         const tw = lbl.length * 7 + 10
         ctx.fillStyle = isHov ? '#0F6E56' : '#1D9E75'
@@ -320,57 +368,59 @@ export default function FloorPlanAnalyzer() {
       })
     }
 
+    // ── Windows ───────────────────────────────────────────────────────────
     if (showWindows) {
       windows.forEach(w => {
         const isHov = hoveredId === w.id
+        const isVert = w.wall_orientation === 'vertical'
         const cx = px(w.center_x)
         const cy = py(w.center_y)
-        const hw = px(w.width_px) / 2
+        const halfW = px(w.width_px) / 2
+
         ctx.strokeStyle = isHov ? '#BA7517' : '#BA751799'
         ctx.lineWidth = isHov ? 4 : 3
         ctx.beginPath()
-        ctx.moveTo(cx - hw, cy)
-        ctx.lineTo(cx + hw, cy)
-        ctx.stroke()
-
-        ctx.strokeStyle = isHov ? '#BA7517' : '#BA751799'
-        ctx.lineWidth = 2
-        ctx.beginPath()
-        ctx.moveTo(cx - hw, cy - 5)
-        ctx.lineTo(cx - hw, cy + 5)
-        ctx.moveTo(cx + hw, cy - 5)
-        ctx.lineTo(cx + hw, cy + 5)
+        if (isVert) {
+          ctx.moveTo(cx, cy - halfW); ctx.lineTo(cx, cy + halfW)
+          ctx.moveTo(cx - 5, cy - halfW); ctx.lineTo(cx + 5, cy - halfW)
+          ctx.moveTo(cx - 5, cy + halfW); ctx.lineTo(cx + 5, cy + halfW)
+        } else {
+          ctx.moveTo(cx - halfW, cy); ctx.lineTo(cx + halfW, cy)
+          ctx.moveTo(cx - halfW, cy - 5); ctx.lineTo(cx - halfW, cy + 5)
+          ctx.moveTo(cx + halfW, cy - 5); ctx.lineTo(cx + halfW, cy + 5)
+        }
         ctx.stroke()
 
         const lbl = w.id
         const tw = lbl.length * 7 + 10
+        const labelY = isVert ? cy : cy - 16
         ctx.fillStyle = isHov ? '#854F0B' : '#BA7517'
         ctx.beginPath()
-        ctx.roundRect(cx - tw / 2, cy - 22, tw, 16, 3)
+        ctx.roundRect(cx - tw / 2, labelY - 9, tw, 16, 3)
         ctx.fill()
         ctx.fillStyle = '#fff'
         ctx.font = 'bold 10px sans-serif'
         ctx.textAlign = 'center'
         ctx.textBaseline = 'middle'
-        ctx.fillText(lbl, cx, cy - 14)
+        ctx.fillText(lbl, cx, labelY)
       })
     }
   }
 
-  const cal = analysis?.calibration
-  const doors = analysis?.doors || []
+  const cal      = analysis?.calibration
+  const doors    = analysis?.doors    || []
   const passages = analysis?.passages || []
-  const windows = analysis?.windows || []
-  const rooms = analysis?.rooms || []
+  const windows  = analysis?.windows  || []
+  const rooms    = analysis?.rooms    || []
 
   return (
     <div className="fpa-root">
       <header className="fpa-header">
         <div className="fpa-logo">
           <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
-            <rect x="1" y="1" width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
-            <rect x="11" y="1" width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
-            <rect x="1" y="11" width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+            <rect x="1"  y="1"  width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+            <rect x="11" y="1"  width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
+            <rect x="1"  y="11" width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
             <rect x="11" y="11" width="8" height="8" stroke="currentColor" strokeWidth="1.5" fill="none"/>
           </svg>
           CarpetPlan
@@ -402,47 +452,60 @@ export default function FloorPlanAnalyzer() {
           ) : (
             <div className="fpa-canvas-area">
               <div className="fpa-toggles">
-                <button className={`fpa-toggle ${showDimensions ? 'on blue' : ''}`} onClick={() => setShowDimensions(v => !v)}>
+                <button className={`fpa-toggle ${showDimensions ? 'on blue' : ''}`}  onClick={() => setShowDimensions(v => !v)}>
                   <span className="tog-dot"></span> Dimensions
                 </button>
-                <button className={`fpa-toggle ${showDoors ? 'on red' : ''}`} onClick={() => setShowDoors(v => !v)}>
+                <button className={`fpa-toggle ${showDoors    ? 'on red'  : ''}`}  onClick={() => setShowDoors(v => !v)}>
                   <span className="tog-dot"></span> Doors
                 </button>
-                <button className={`fpa-toggle ${showPassages ? 'on green' : ''}`} onClick={() => setShowPassages(v => !v)}>
+                <button className={`fpa-toggle ${showPassages ? 'on green': ''}`}  onClick={() => setShowPassages(v => !v)}>
                   <span className="tog-dot"></span> Passages
                 </button>
-                <button className={`fpa-toggle ${showWindows ? 'on amber' : ''}`} onClick={() => setShowWindows(v => !v)}>
+                <button className={`fpa-toggle ${showWindows  ? 'on amber': ''}`}  onClick={() => setShowWindows(v => !v)}>
                   <span className="tog-dot"></span> Windows
                 </button>
-                <button className="fpa-toggle reset" onClick={() => { setImage(null); setAnalysis(null); setError(null) }}>
+                <button className="fpa-toggle reset" onClick={() => {
+                  setImage(null); setAnalysis(null); setError(null); setImgReady(false)
+                }}>
                   Clear
                 </button>
               </div>
 
-              <div className="fpa-img-wrap" ref={containerRef}>
+              <div className="fpa-img-wrap">
                 <img
                   ref={imgRef}
                   src={image}
                   alt="Floor plan"
                   className="fpa-img"
-                  onLoad={() => { if (analysis) drawOverlay() }}
+                  onLoad={onImgLoad}
                 />
                 <canvas ref={canvasRef} className="fpa-overlay" />
               </div>
             </div>
           )}
 
-          {image && !analysis && (
+          {/* Bug 3 fix: always show when image loaded, label changes to Re-analyze */}
+          {image && (
             <button className="fpa-analyze-btn" onClick={analyze} disabled={loading}>
               {loading ? (
                 <><span className="spin"></span>{loadingStep}</>
               ) : (
-                <><svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5"/><path d="M8 5v3l2 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/></svg> Analyze Floor Plan</>
+                <>
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                    <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.5"/>
+                    <path d="M8 5v3l2 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                  </svg>
+                  {analysis ? 'Re-analyze' : 'Analyze Floor Plan'}
+                </>
               )}
             </button>
           )}
 
-          {error && <div className="fpa-error">{error}</div>}
+          {error && (
+            <div className="fpa-error">
+              <strong>Analysis failed:</strong> {error}
+            </div>
+          )}
         </div>
 
         {analysis && (
@@ -455,16 +518,16 @@ export default function FloorPlanAnalyzer() {
                   <span className="cal-eq">{cal.label_text}</span>
                   <span className="cal-px">{cal.pixels_per_meter?.toFixed(1)} px/m</span>
                 </div>
-                <div className="fpa-cal-conf conf-{cal.confidence}">{cal.confidence} confidence</div>
+                <div className={`fpa-cal-conf ${cal.confidence}`}>{cal.confidence} confidence</div>
               </div>
             )}
 
             <div className="fpa-tabs">
               {[
-                { id: 'doors', label: `Doors (${doors.length})`, color: 'red' },
+                { id: 'doors',    label: `Doors (${doors.length})`,       color: 'red'   },
                 { id: 'passages', label: `Passages (${passages.length})`, color: 'green' },
-                { id: 'windows', label: `Windows (${windows.length})`, color: 'amber' },
-                { id: 'rooms', label: `Rooms (${rooms.length})`, color: 'blue' },
+                { id: 'windows',  label: `Windows (${windows.length})`,   color: 'amber' },
+                { id: 'rooms',    label: `Rooms (${rooms.length})`,       color: 'blue'  },
               ].map(t => (
                 <button
                   key={t.id}
@@ -487,14 +550,13 @@ export default function FloorPlanAnalyzer() {
                     >
                       <div className="fpa-item-head">
                         <span className="fpa-item-id red">{d.id}</span>
-                        <span className="fpa-item-type">Swing door</span>
-                        <span className="fpa-item-dim">{d.gap_width_m?.toFixed(2)}m wide</span>
+                        <span className="fpa-item-type">{d.type === 'swing' ? 'Swing door' : d.type}</span>
+                        <span className="fpa-item-dim">{d.gap_width_m?.toFixed(2)}m</span>
                       </div>
                       <div className="fpa-item-loc">{d.location}</div>
                       <div className="fpa-item-meta">
                         {d.connects?.join(' → ')}
-                        {d.swing_from && <span className="fpa-chip">swing from {d.swing_from}</span>}
-                        {d.swing_direction && <span className="fpa-chip">{d.swing_direction}</span>}
+                        {d.wall_orientation && <span className="fpa-chip">{d.wall_orientation}</span>}
                       </div>
                     </div>
                   ))}
@@ -514,10 +576,13 @@ export default function FloorPlanAnalyzer() {
                       <div className="fpa-item-head">
                         <span className="fpa-item-id green">{p.id}</span>
                         <span className="fpa-item-type">Open passage</span>
-                        <span className="fpa-item-dim">{p.gap_width_m?.toFixed(2)}m wide</span>
+                        <span className="fpa-item-dim">{p.gap_width_m?.toFixed(2)}m</span>
                       </div>
                       <div className="fpa-item-loc">{p.location}</div>
-                      <div className="fpa-item-meta">{p.connects?.join(' → ')}</div>
+                      <div className="fpa-item-meta">
+                        {p.connects?.join(' → ')}
+                        {p.wall_orientation && <span className="fpa-chip">{p.wall_orientation}</span>}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -536,10 +601,10 @@ export default function FloorPlanAnalyzer() {
                       <div className="fpa-item-head">
                         <span className="fpa-item-id amber">{w.id}</span>
                         <span className="fpa-item-type">Window</span>
-                        <span className="fpa-item-dim">{w.width_m?.toFixed(2)}m wide</span>
+                        <span className="fpa-item-dim">{w.width_m?.toFixed(2)}m</span>
                       </div>
                       <div className="fpa-item-loc">{w.location}</div>
-                      <div className="fpa-item-meta">{w.wall_side} wall</div>
+                      <div className="fpa-item-meta">{w.wall_orientation} wall</div>
                     </div>
                   ))}
                 </div>
@@ -567,9 +632,12 @@ export default function FloorPlanAnalyzer() {
                           {r.walls?.map(w => (
                             <tr key={w.side}>
                               <td>{w.side}</td>
-                              <td><strong>{w.length_m?.toFixed(2)}m</strong> <span className="fpa-px">({Math.round(w.length_px)}px)</span></td>
                               <td>
-                                {w.has_door && <span className="fpa-flag red">door</span>}
+                                <strong>{isNaN(w.length_m) ? '?' : w.length_m?.toFixed(2)}m</strong>
+                                <span className="fpa-px"> ({Math.round(w.length_px || 0)}px)</span>
+                              </td>
+                              <td>
+                                {w.has_door   && <span className="fpa-flag red">door</span>}
                                 {w.has_window && <span className="fpa-flag amber">window</span>}
                               </td>
                             </tr>
