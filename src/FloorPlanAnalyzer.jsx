@@ -246,38 +246,106 @@ export default function FloorPlanAnalyzer() {
 
     const { doors = [], passages = [], windows = [], rooms = [] } = analysis
 
-    // ── Dimension overlays ───────────────────────────────────────────────
+    // ── Dimension overlays — parallel to walls, architectural style ────────
     if (showDimensions && rooms.length > 0) {
+      const OFFSET = 18   // px gap between wall edge and dimension line
+      const TICK   = 6    // half-length of end tick marks
+
       rooms.forEach(room => {
         const bb = room.bounding_box
         if (!bb) return
         const isHov = hoveredId === room.name
-
-        ctx.strokeStyle = isHov ? '#378ADD' : '#378ADD66'
-        ctx.lineWidth = isHov ? 2 : 1
-        ctx.setLineDash([6, 4])
-        ctx.strokeRect(px(bb.x), py(bb.y), px(bb.w), py(bb.h))
-        ctx.setLineDash([])
+        const lineColor = isHov ? '#185FA5' : '#378ADD'
+        const textColor = isHov ? '#0C447C' : '#185FA5'
 
         room.walls?.forEach(wall => {
           if (!wall.length_m || isNaN(wall.length_m)) return
-          const lbl = wall.length_m.toFixed(1) + 'm'
-          let tx, ty
-          if      (wall.side === 'north') { tx = px(bb.x + bb.w / 2); ty = py(bb.y) - 12 }
-          else if (wall.side === 'south') { tx = px(bb.x + bb.w / 2); ty = py(bb.y + bb.h) + 12 }
-          else if (wall.side === 'west')  { tx = px(bb.x) - 20; ty = py(bb.y + bb.h / 2) }
-          else                            { tx = px(bb.x + bb.w) + 20; ty = py(bb.y + bb.h / 2) }
+          const lbl = wall.length_m.toFixed(2) + 'm'
+          const side = wall.side
 
-          const tw = lbl.length * 6.5 + 10
-          ctx.fillStyle = isHov ? '#0C447C' : '#185FA5'
+          // Compute the two endpoints of the dimension line, offset from the wall
+          let x1, y1, x2, y2, midX, midY, angle
+
+          if (side === 'north') {
+            x1 = px(bb.x);        y1 = py(bb.y) - OFFSET
+            x2 = px(bb.x + bb.w); y2 = py(bb.y) - OFFSET
+            midX = (x1 + x2) / 2; midY = y1
+            angle = 0
+          } else if (side === 'south') {
+            x1 = px(bb.x);        y1 = py(bb.y + bb.h) + OFFSET
+            x2 = px(bb.x + bb.w); y2 = py(bb.y + bb.h) + OFFSET
+            midX = (x1 + x2) / 2; midY = y1
+            angle = 0
+          } else if (side === 'west') {
+            x1 = px(bb.x) - OFFSET; y1 = py(bb.y)
+            x2 = px(bb.x) - OFFSET; y2 = py(bb.y + bb.h)
+            midX = x1; midY = (y1 + y2) / 2
+            angle = -Math.PI / 2
+          } else { // east
+            x1 = px(bb.x + bb.w) + OFFSET; y1 = py(bb.y)
+            x2 = px(bb.x + bb.w) + OFFSET; y2 = py(bb.y + bb.h)
+            midX = x1; midY = (y1 + y2) / 2
+            angle = -Math.PI / 2
+          }
+
+          // Draw dimension line
+          ctx.strokeStyle = lineColor
+          ctx.lineWidth = 1.5
+          ctx.setLineDash([])
           ctx.beginPath()
-          ctx.roundRect(tx - tw / 2, ty - 9, tw, 18, 3)
-          ctx.fill()
-          ctx.fillStyle = '#fff'
-          ctx.font = `${isHov ? '600' : '500'} 11px sans-serif`
+          ctx.moveTo(x1, y1)
+          ctx.lineTo(x2, y2)
+          ctx.stroke()
+
+          // Draw tick marks at both ends (perpendicular to wall)
+          ctx.lineWidth = 1.5
+          ctx.beginPath()
+          if (side === 'north' || side === 'south') {
+            ctx.moveTo(x1, y1 - TICK); ctx.lineTo(x1, y1 + TICK)
+            ctx.moveTo(x2, y2 - TICK); ctx.lineTo(x2, y2 + TICK)
+          } else {
+            ctx.moveTo(x1 - TICK, y1); ctx.lineTo(x1 + TICK, y1)
+            ctx.moveTo(x2 - TICK, y2); ctx.lineTo(x2 + TICK, y2)
+          }
+          ctx.stroke()
+
+          // Draw extension lines from wall corners to dimension line
+          ctx.strokeStyle = lineColor + '66'
+          ctx.lineWidth = 1
+          ctx.setLineDash([3, 3])
+          ctx.beginPath()
+          if (side === 'north') {
+            ctx.moveTo(x1, py(bb.y)); ctx.lineTo(x1, y1)
+            ctx.moveTo(x2, py(bb.y)); ctx.lineTo(x2, y2)
+          } else if (side === 'south') {
+            ctx.moveTo(x1, py(bb.y + bb.h)); ctx.lineTo(x1, y1)
+            ctx.moveTo(x2, py(bb.y + bb.h)); ctx.lineTo(x2, y2)
+          } else if (side === 'west') {
+            ctx.moveTo(px(bb.x), y1); ctx.lineTo(x1, y1)
+            ctx.moveTo(px(bb.x), y2); ctx.lineTo(x2, y2)
+          } else {
+            ctx.moveTo(px(bb.x + bb.w), y1); ctx.lineTo(x1, y1)
+            ctx.moveTo(px(bb.x + bb.w), y2); ctx.lineTo(x2, y2)
+          }
+          ctx.stroke()
+          ctx.setLineDash([])
+
+          // Draw label — rotated for vertical walls
+          ctx.save()
+          ctx.translate(midX, midY)
+          ctx.rotate(angle)
+          ctx.font = `500 11px sans-serif`
           ctx.textAlign = 'center'
           ctx.textBaseline = 'middle'
-          ctx.fillText(lbl, tx, ty)
+          const tw = ctx.measureText(lbl).width + 8
+          // White background pill behind text
+          ctx.fillStyle = 'rgba(255,255,255,0.92)'
+          ctx.beginPath()
+          ctx.roundRect(-tw / 2, -9, tw, 18, 3)
+          ctx.fill()
+          ctx.fillStyle = textColor
+          ctx.fillText(lbl, 0, 0)
+          ctx.restore()
         })
       })
     }
