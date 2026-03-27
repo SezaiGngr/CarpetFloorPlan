@@ -32,11 +32,6 @@ A. SWING DOOR: gap in wall + quarter-circle arc drawn from one end
 B. OPEN PASSAGE: gap with NO arc (wardrobe entries, open archways)
 C. WINDOW: gap in exterior wall with double sill line
 
-STEP 4 — DIMENSION LINES (important for drawing):
-For each wall, also provide the actual start and end pixel coordinates of that wall edge so dimension lines can be drawn precisely:
-- wall_x1, wall_y1 = start point of wall in full image pixels
-- wall_x2, wall_y2 = end point of wall in full image pixels
-
 Return ONLY valid JSON, nothing else:
 
 {
@@ -53,14 +48,13 @@ Return ONLY valid JSON, nothing else:
   "floorplan_bounds": { "x": 60, "y": 420, "w": 550, "h": 650 },
   "rooms": [
     {
-      "name": "Living",
-      "label": "5 x 6m",
+      "name": "Living", "label": "5 x 6m",
       "bounding_box": { "x": 190, "y": 580, "w": 280, "h": 336 },
       "walls": [
-        { "side": "north", "length_px": 280, "length_m": 5.0, "has_door": true,  "has_window": false, "wall_x1": 190, "wall_y1": 580, "wall_x2": 470, "wall_y2": 580 },
-        { "side": "east",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": false, "wall_x1": 470, "wall_y1": 580, "wall_x2": 470, "wall_y2": 916 },
-        { "side": "south", "length_px": 280, "length_m": 5.0, "has_door": false, "has_window": false, "wall_x1": 190, "wall_y1": 916, "wall_x2": 470, "wall_y2": 916 },
-        { "side": "west",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": true,  "wall_x1": 190, "wall_y1": 580, "wall_x2": 190, "wall_y2": 916 }
+        { "side": "north", "length_m": 5.0, "has_door": true,  "has_window": false },
+        { "side": "east",  "length_m": 6.0, "has_door": false, "has_window": false },
+        { "side": "south", "length_m": 5.0, "has_door": false, "has_window": false },
+        { "side": "west",  "length_m": 6.0, "has_door": false, "has_window": true  }
       ]
     }
   ],
@@ -160,7 +154,7 @@ export default function FloorPlanAnalyzer() {
         },
         body: JSON.stringify({
           model: MODEL,
-          max_tokens: 4000,
+          max_tokens: 8000,
           messages: [{
             role: 'user',
             content: [
@@ -176,7 +170,29 @@ export default function FloorPlanAnalyzer() {
       if (!response.ok) throw new Error(data.error?.message || 'API error')
 
       const raw = data.content.map(b => b.text || '').join('')
-      const clean = raw.replace(/```json|```/g, '').trim()
+      let clean = raw.replace(/```json|```/g, '').trim()
+      // Repair truncated JSON by finding last complete object
+      try {
+        JSON.parse(clean)
+      } catch(e) {
+        // Try to fix truncated JSON - find last valid closing
+        const lastBrace = clean.lastIndexOf('}')
+        if (lastBrace > 0) {
+          // Count unclosed brackets and braces
+          let depth = 0, arrDepth = 0
+          for (let i = 0; i < clean.length; i++) {
+            if (clean[i] === '{') depth++
+            else if (clean[i] === '}') depth--
+            else if (clean[i] === '[') arrDepth++
+            else if (clean[i] === ']') arrDepth--
+          }
+          // Close any open arrays and objects
+          let suffix = ''
+          for (let i = 0; i < arrDepth; i++) suffix += ']'
+          for (let i = 0; i < depth; i++) suffix += '}'
+          clean = clean + suffix
+        }
+      }
       const parsed = JSON.parse(clean)
 
       // Bug 6 fix: validate calibration before accepting
