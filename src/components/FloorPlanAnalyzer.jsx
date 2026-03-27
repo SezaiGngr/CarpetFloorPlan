@@ -34,7 +34,7 @@ A. SWING DOOR: gap in wall + quarter-circle arc drawn from one end
 B. OPEN PASSAGE: gap with NO arc (wardrobe entries, open archways)
 C. WINDOW: gap in exterior wall with double sill line
 
-Return ONLY valid JSON, nothing else:
+CRITICAL: Your response must start with { and contain ONLY the JSON object. No introduction, no "Looking at", no explanation, no markdown. The very first character of your response must be {. Return ONLY:
 
 {
   "calibration": {
@@ -172,28 +172,31 @@ export default function FloorPlanAnalyzer() {
       if (!response.ok) throw new Error(data.error?.message || 'API error')
 
       const raw = data.content.map(b => b.text || '').join('')
+      // Strip markdown fences
       let clean = raw.replace(/```json|```/g, '').trim()
-      // Repair truncated JSON by finding last complete object
+      // Extract just the JSON object — find first { and match to its closing }
+      const firstBrace = clean.indexOf('{')
+      if (firstBrace > 0) clean = clean.slice(firstBrace)
+      // Repair truncated JSON by closing unclosed brackets/braces
       try {
         JSON.parse(clean)
       } catch(e) {
-        // Try to fix truncated JSON - find last valid closing
-        const lastBrace = clean.lastIndexOf('}')
-        if (lastBrace > 0) {
-          // Count unclosed brackets and braces
-          let depth = 0, arrDepth = 0
-          for (let i = 0; i < clean.length; i++) {
-            if (clean[i] === '{') depth++
-            else if (clean[i] === '}') depth--
-            else if (clean[i] === '[') arrDepth++
-            else if (clean[i] === ']') arrDepth--
-          }
-          // Close any open arrays and objects
-          let suffix = ''
-          for (let i = 0; i < arrDepth; i++) suffix += ']'
-          for (let i = 0; i < depth; i++) suffix += '}'
-          clean = clean + suffix
+        let depth = 0, arrDepth = 0, inStr = false, escape = false
+        for (let i = 0; i < clean.length; i++) {
+          const c = clean[i]
+          if (escape) { escape = false; continue }
+          if (c === '\\' && inStr) { escape = true; continue }
+          if (c === '"') { inStr = !inStr; continue }
+          if (inStr) continue
+          if (c === '{') depth++
+          else if (c === '}') depth--
+          else if (c === '[') arrDepth++
+          else if (c === ']') arrDepth--
         }
+        let suffix = ''
+        for (let i = 0; i < arrDepth; i++) suffix += ']'
+        for (let i = 0; i < depth; i++) suffix += '}'
+        if (suffix) clean = clean + suffix
       }
       const parsed = JSON.parse(clean)
 
