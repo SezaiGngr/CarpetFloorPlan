@@ -476,3 +476,11 @@ body {
   .fpa-right { width: 100%; max-height: none; border-left: none; border-top: 0.5px solid var(--border); }
   .fpa-left { padding: 12px; }
 }
+
+.fpa-drawn-plan {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius);
+  border: 0.5px solid var(--border);
+}
