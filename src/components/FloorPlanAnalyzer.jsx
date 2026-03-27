@@ -19,9 +19,11 @@ STEP 1 — CALIBRATION:
 STEP 2 — MAP EVERY SINGLE ROOM (critical — do not skip any):
 List EVERY space visible: bedrooms, bathroom, kitchen, laundry, living, dining, robe/wardrobe, linen, balcony, garage, entry, corridor — ALL of them.
 For each room provide:
-- Exact bounding_box in full-image pixels (x, y, w, h)
-- ALL 4 walls (north/south/east/west) with pixel length and meter length
-- Walls that are shared between rooms still get measured individually per room
+- Exact bounding_box in full-image pixels (x, y, w, h) — MUST be inside the floorplan_bounds area, never in black border
+- ALL 4 walls (north/south/east/west) with meter length derived from calibration
+- Use the labeled dimension if available (e.g. room says "5 x 6m" → north/south walls = 5.0m, east/west = 6.0m)
+- Do NOT duplicate shared walls — if Living north wall = Bed south wall, they are the same measurement
+- Keep bounding boxes tight to the actual room walls, not the whole image
 
 STEP 3 — DOOR DETECTION:
 A. SWING DOOR: gap in wall + quarter-circle arc drawn from one end
@@ -249,81 +251,104 @@ export default function FloorPlanAnalyzer() {
 
     const { doors = [], passages = [], windows = [], rooms = [] } = analysis
 
-    // ── Dimension overlays — precise architectural style ────────────────────
+    // ── Dimension overlays — architectural style, deduplicated ─────────────
     if (showDimensions && rooms.length > 0) {
-      const OFFSET = 22
-      const TICK = 7
+      const OFFSET = 24
+      const TICK = 6
+      const lineColor = '#2563eb'
+      const textColor = '#1e3a5f'
+
+      // Get floorplan bounds to clamp labels inside drawing area
+      const fpb = analysis.floorplan_bounds
+      const minY = fpb ? py(fpb.y) : 0
+      const maxY = fpb ? py(fpb.y + fpb.h) : dH
+      const minX = fpb ? px(fpb.x) : 0
+      const maxX = fpb ? px(fpb.x + fpb.w) : dW
+
+      // Deduplicate: track drawn dimension lines by key to avoid drawing same wall twice
+      const drawnDims = new Set()
 
       rooms.forEach(room => {
         const bb = room.bounding_box
         if (!bb) return
         const isHov = hoveredId === room.name
-        const lineColor = isHov ? '#185FA5' : '#2563eb'
-        const textColor = isHov ? '#0C447C' : '#1e3a5f'
+        const color = isHov ? '#185FA5' : lineColor
+        const tcolor = isHov ? '#0C447C' : textColor
 
         room.walls?.forEach(wall => {
           if (!wall.length_m || isNaN(wall.length_m)) return
-          const lbl = wall.length_m.toFixed(2) + 'm'
           const side = wall.side
 
-          // Use precise wall coords if available, fallback to bounding box
+          // Wall endpoints from bounding box
           let wx1, wy1, wx2, wy2
-          if (wall.wall_x1 != null) {
-            wx1 = px(wall.wall_x1); wy1 = py(wall.wall_y1)
-            wx2 = px(wall.wall_x2); wy2 = py(wall.wall_y2)
-          } else {
-            if (side === 'north')      { wx1 = px(bb.x); wy1 = py(bb.y);        wx2 = px(bb.x+bb.w); wy2 = py(bb.y) }
-            else if (side === 'south') { wx1 = px(bb.x); wy1 = py(bb.y+bb.h);   wx2 = px(bb.x+bb.w); wy2 = py(bb.y+bb.h) }
-            else if (side === 'west')  { wx1 = px(bb.x); wy1 = py(bb.y);        wx2 = px(bb.x);       wy2 = py(bb.y+bb.h) }
-            else                       { wx1 = px(bb.x+bb.w); wy1 = py(bb.y);   wx2 = px(bb.x+bb.w); wy2 = py(bb.y+bb.h) }
-          }
+          if (side === 'north')      { wx1 = px(bb.x); wy1 = py(bb.y);       wx2 = px(bb.x+bb.w); wy2 = py(bb.y) }
+          else if (side === 'south') { wx1 = px(bb.x); wy1 = py(bb.y+bb.h);  wx2 = px(bb.x+bb.w); wy2 = py(bb.y+bb.h) }
+          else if (side === 'west')  { wx1 = px(bb.x); wy1 = py(bb.y);       wx2 = px(bb.x);      wy2 = py(bb.y+bb.h) }
+          else                       { wx1 = px(bb.x+bb.w); wy1 = py(bb.y);  wx2 = px(bb.x+bb.w); wy2 = py(bb.y+bb.h) }
 
-          // Dimension line offset direction
-          let dx1, dy1, dx2, dy2, angle
+          // Clamp wall endpoints to floorplan bounds — prevents bleeding into black border
+          wx1 = Math.max(minX, Math.min(maxX, wx1))
+          wy1 = Math.max(minY, Math.min(maxY, wy1))
+          wx2 = Math.max(minX, Math.min(maxX, wx2))
+          wy2 = Math.max(minY, Math.min(maxY, wy2))
+
+          // Deduplicate by rounded wall position + side
+          const dimKey = `${Math.round(wx1)},${Math.round(wy1)},${Math.round(wx2)},${Math.round(wy2)}`
+          if (drawnDims.has(dimKey)) return
+          drawnDims.add(dimKey)
+
+          const lbl = wall.length_m.toFixed(2) + 'm'
           const isHoriz = (side === 'north' || side === 'south')
+
+          // Offset dimension line away from wall — always toward OUTSIDE of room
+          let dx1, dy1, dx2, dy2, angle
           if (side === 'north') {
-            dx1 = wx1; dy1 = wy1 - OFFSET; dx2 = wx2; dy2 = wy2 - OFFSET; angle = 0
+            dy1 = Math.max(minY + 2, wy1 - OFFSET)
+            dx1 = wx1; dx2 = wx2; dy2 = dy1; angle = 0
           } else if (side === 'south') {
-            dx1 = wx1; dy1 = wy1 + OFFSET; dx2 = wx2; dy2 = wy2 + OFFSET; angle = 0
+            dy1 = Math.min(maxY - 2, wy1 + OFFSET)
+            dx1 = wx1; dx2 = wx2; dy2 = dy1; angle = 0
           } else if (side === 'west') {
-            dx1 = wx1 - OFFSET; dy1 = wy1; dx2 = wx2 - OFFSET; dy2 = wy2; angle = -Math.PI/2
+            dx1 = Math.max(minX + 2, wx1 - OFFSET)
+            dy1 = wy1; dy2 = wy2; dx2 = dx1; angle = -Math.PI/2
           } else {
-            dx1 = wx1 + OFFSET; dy1 = wy1; dx2 = wx2 + OFFSET; dy2 = wy2; angle = -Math.PI/2
+            dx1 = Math.min(maxX - 2, wx1 + OFFSET)
+            dy1 = wy1; dy2 = wy2; dx2 = dx1; angle = -Math.PI/2
           }
 
           const midX = (dx1 + dx2) / 2
           const midY = (dy1 + dy2) / 2
 
-          // Extension lines
-          ctx.strokeStyle = lineColor + '88'
-          ctx.lineWidth = 1
-          ctx.setLineDash([4, 3])
+          // Extension lines (dashed)
+          ctx.strokeStyle = color + '77'
+          ctx.lineWidth = 0.8
+          ctx.setLineDash([3, 3])
           ctx.beginPath()
           ctx.moveTo(wx1, wy1); ctx.lineTo(dx1, dy1)
           ctx.moveTo(wx2, wy2); ctx.lineTo(dx2, dy2)
           ctx.stroke()
           ctx.setLineDash([])
 
-          // Dimension line
-          ctx.strokeStyle = lineColor
+          // Main dimension line
+          ctx.strokeStyle = color
           ctx.lineWidth = 1.5
           ctx.beginPath()
           ctx.moveTo(dx1, dy1); ctx.lineTo(dx2, dy2)
           ctx.stroke()
 
-          // Tick marks (45-degree slash style)
+          // Slash tick marks at ends
           ctx.lineWidth = 1.5
           ctx.beginPath()
           if (isHoriz) {
-            ctx.moveTo(dx1 - 4, dy1 - TICK); ctx.lineTo(dx1 + 4, dy1 + TICK)
-            ctx.moveTo(dx2 - 4, dy2 - TICK); ctx.lineTo(dx2 + 4, dy2 + TICK)
+            ctx.moveTo(dx1-4, dy1-TICK); ctx.lineTo(dx1+4, dy1+TICK)
+            ctx.moveTo(dx2-4, dy2-TICK); ctx.lineTo(dx2+4, dy2+TICK)
           } else {
-            ctx.moveTo(dx1 - TICK, dy1 - 4); ctx.lineTo(dx1 + TICK, dy1 + 4)
-            ctx.moveTo(dx2 - TICK, dy2 - 4); ctx.lineTo(dx2 + TICK, dy2 + 4)
+            ctx.moveTo(dx1-TICK, dy1-4); ctx.lineTo(dx1+TICK, dy1+4)
+            ctx.moveTo(dx2-TICK, dy2-4); ctx.lineTo(dx2+TICK, dy2+4)
           }
           ctx.stroke()
 
-          // Label — rotated for vertical walls
+          // Label pill — white background, border, rotated for vertical
           ctx.save()
           ctx.translate(midX, midY)
           ctx.rotate(angle)
@@ -331,14 +356,14 @@ export default function FloorPlanAnalyzer() {
           ctx.textAlign = 'center'
           ctx.textBaseline = 'middle'
           const tw = ctx.measureText(lbl).width + 10
-          ctx.fillStyle = 'rgba(255,255,255,0.95)'
+          ctx.fillStyle = 'rgba(255,255,255,0.96)'
           ctx.beginPath()
-          ctx.roundRect(-tw/2, -9, tw, 18, 3)
+          ctx.roundRect(-tw/2, -8, tw, 16, 3)
           ctx.fill()
-          ctx.strokeStyle = lineColor + '66'
+          ctx.strokeStyle = color + '55'
           ctx.lineWidth = 0.5
           ctx.stroke()
-          ctx.fillStyle = textColor
+          ctx.fillStyle = tcolor
           ctx.fillText(lbl, 0, 0)
           ctx.restore()
         })
