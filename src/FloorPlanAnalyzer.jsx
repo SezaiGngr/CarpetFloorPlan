@@ -162,9 +162,15 @@ export default function FloorPlanAnalyzer() {
       const base64 = image.split(',')[1]
       const mediaType = image.split(';')[0].split(':')[1]
 
-      const response = await fetch('/api/analyze', {
+      const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
         body: JSON.stringify({
           model: MODEL,
           max_tokens: 4000,
