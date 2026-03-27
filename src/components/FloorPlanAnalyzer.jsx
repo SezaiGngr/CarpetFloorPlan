@@ -231,280 +231,260 @@ export default function FloorPlanAnalyzer() {
 
   const drawOverlay = () => {
     const canvas = canvasRef.current
-    const img = imgRef.current
-    if (!canvas || !img) return
+    if (!canvas) return
 
-    const dW = img.offsetWidth
-    const dH = img.offsetHeight
-    if (!dW || !dH) return  // image not yet painted
+    const rooms = analysis?.rooms || []
+    const doors = analysis?.doors || []
+    const passages = analysis?.passages || []
+    const windows = analysis?.windows || []
+    const fpb = analysis?.floorplan_bounds
+    const cal = analysis?.calibration
 
-    canvas.width = dW
-    canvas.height = dH
+    if (!fpb || !cal || rooms.length === 0) return
 
-    const natW = imageNaturalSize.w
-    const natH = imageNaturalSize.h
-    const scX = dW / natW
-    const scY = dH / natH
+    // Canvas size: draw at 2x the floor plan pixel size for clarity
+    const SCALE = 900 / fpb.w  // fit to 900px wide
+    const W = Math.round(fpb.w * SCALE)
+    const H = Math.round(fpb.h * SCALE)
+    const PAD = 60  // padding for dimension labels
+
+    canvas.width  = W + PAD * 2
+    canvas.height = H + PAD * 2
 
     const ctx = canvas.getContext('2d')
-    ctx.clearRect(0, 0, dW, dH)
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-    const px = x => x * scX
-    const py = y => y * scY
+    // White background
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, canvas.width, canvas.height)
 
-    const { doors = [], passages = [], windows = [], rooms = [] } = analysis
+    // Coordinate transform: from original image coords to canvas coords
+    const tx = x => PAD + (x - fpb.x) * SCALE
+    const ty = y => PAD + (y - fpb.y) * SCALE
+    const ts = v => v * SCALE  // scale a length
 
-    // ── Dimension overlays — architectural style, deduplicated ─────────────
-    if (showDimensions && rooms.length > 0) {
-      const OFFSET = 24
+    // ── Draw room fills ──────────────────────────────────────────────────
+    const roomColors = [
+      '#f0f4ff','#f0fff4','#fff8f0','#f5f0ff','#f0f9ff',
+      '#fefce8','#fdf2f8','#f0fdfa','#fff1f2','#f7fee7'
+    ]
+    rooms.forEach((room, i) => {
+      const bb = room.bounding_box
+      if (!bb) return
+      ctx.fillStyle = roomColors[i % roomColors.length]
+      ctx.fillRect(tx(bb.x), ty(bb.y), ts(bb.w), ts(bb.h))
+    })
+
+    // ── Draw room walls (thick black lines) ──────────────────────────────
+    ctx.strokeStyle = '#1a1a1a'
+    ctx.lineWidth = Math.max(2, ts(4))
+    ctx.lineJoin = 'miter'
+    rooms.forEach(room => {
+      const bb = room.bounding_box
+      if (!bb) return
+      ctx.strokeRect(tx(bb.x), ty(bb.y), ts(bb.w), ts(bb.h))
+    })
+
+    // ── Draw door arcs ───────────────────────────────────────────────────
+    if (showDoors) {
+      doors.forEach(door => {
+        const avgScale = SCALE
+        const arcCx = tx(door.arc_center_x)
+        const arcCy = ty(door.arc_center_y)
+        const arcR  = door.arc_radius_px * avgScale
+        const startRad = (door.arc_start_deg ?? 0)  * Math.PI / 180
+        const endRad   = (door.arc_end_deg   ?? 90) * Math.PI / 180
+
+        // Door gap (white out the wall)
+        const isVert = door.wall_orientation === 'vertical'
+        ctx.strokeStyle = '#ffffff'
+        ctx.lineWidth = Math.max(4, ts(6))
+        ctx.beginPath()
+        if (isVert) {
+          ctx.moveTo(tx(door.gap_x), ty(door.gap_y))
+          ctx.lineTo(tx(door.gap_x), ty(door.gap_y + door.gap_width_px))
+        } else {
+          ctx.moveTo(tx(door.gap_x), ty(door.gap_y))
+          ctx.lineTo(tx(door.gap_x + door.gap_width_px), ty(door.gap_y))
+        }
+        ctx.stroke()
+
+        // Door swing arc
+        ctx.strokeStyle = '#E24B4A'
+        ctx.lineWidth = 1.5
+        ctx.setLineDash([4, 3])
+        ctx.beginPath()
+        ctx.arc(arcCx, arcCy, arcR, startRad, endRad)
+        ctx.stroke()
+        ctx.setLineDash([])
+
+        // Door panel line
+        ctx.strokeStyle = '#E24B4A'
+        ctx.lineWidth = 2
+        ctx.beginPath()
+        ctx.moveTo(arcCx, arcCy)
+        if (isVert) ctx.lineTo(arcCx, arcCy + arcR)
+        else ctx.lineTo(arcCx + arcR, arcCy)
+        ctx.stroke()
+
+        // Label
+        const lx = isVert ? tx(door.gap_x) : tx(door.gap_x + door.gap_width_px/2)
+        const ly = isVert ? ty(door.gap_y + door.gap_width_px/2) : ty(door.gap_y)
+        ctx.fillStyle = '#E24B4A'
+        ctx.font = 'bold 10px sans-serif'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        const lbl = door.id
+        const tw = ctx.measureText(lbl).width + 8
+        ctx.beginPath(); ctx.roundRect(lx-tw/2, ly-8, tw, 16, 3); ctx.fill()
+        ctx.fillStyle = '#fff'; ctx.fillText(lbl, lx, ly)
+      })
+    }
+
+    // ── Draw passages ────────────────────────────────────────────────────
+    if (showPassages) {
+      passages.forEach(p => {
+        const isVert = p.wall_orientation === 'vertical'
+        ctx.strokeStyle = '#ffffff'
+        ctx.lineWidth = Math.max(4, ts(6))
+        ctx.beginPath()
+        if (isVert) {
+          ctx.moveTo(tx(p.gap_x), ty(p.gap_y))
+          ctx.lineTo(tx(p.gap_x), ty(p.gap_y + p.gap_width_px))
+        } else {
+          ctx.moveTo(tx(p.gap_x), ty(p.gap_y))
+          ctx.lineTo(tx(p.gap_x + p.gap_width_px), ty(p.gap_y))
+        }
+        ctx.stroke()
+        const lx = isVert ? tx(p.gap_x) : tx(p.gap_x + p.gap_width_px/2)
+        const ly = isVert ? ty(p.gap_y + p.gap_width_px/2) : ty(p.gap_y)
+        ctx.fillStyle = '#1D9E75'
+        ctx.font = 'bold 10px sans-serif'
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        const lbl = p.id
+        const tw = ctx.measureText(lbl).width + 8
+        ctx.beginPath(); ctx.roundRect(lx-tw/2, ly-8, tw, 16, 3); ctx.fill()
+        ctx.fillStyle = '#fff'; ctx.fillText(lbl, lx, ly)
+      })
+    }
+
+    // ── Draw windows ─────────────────────────────────────────────────────
+    if (showWindows) {
+      windows.forEach(w => {
+        const isVert = w.wall_orientation === 'vertical'
+        const cx = tx(w.center_x), cy = ty(w.center_y)
+        const hw = ts(w.width_px) / 2
+        ctx.strokeStyle = '#60a5fa'
+        ctx.lineWidth = 4
+        ctx.beginPath()
+        if (isVert) { ctx.moveTo(cx, cy-hw); ctx.lineTo(cx, cy+hw) }
+        else        { ctx.moveTo(cx-hw, cy); ctx.lineTo(cx+hw, cy) }
+        ctx.stroke()
+        ctx.fillStyle = '#BA7517'
+        ctx.font = 'bold 10px sans-serif'
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        const lbl = w.id
+        const tw = ctx.measureText(lbl).width + 8
+        const lx = isVert ? cx + 14 : cx
+        const ly = isVert ? cy : cy - 14
+        ctx.beginPath(); ctx.roundRect(lx-tw/2, ly-8, tw, 16, 3); ctx.fill()
+        ctx.fillStyle = '#fff'; ctx.fillText(lbl, lx, ly)
+      })
+    }
+
+    // ── Room labels ──────────────────────────────────────────────────────
+    rooms.forEach(room => {
+      const bb = room.bounding_box
+      if (!bb) return
+      const cx = tx(bb.x + bb.w/2)
+      const cy = ty(bb.y + bb.h/2)
+      ctx.fillStyle = '#374151'
+      ctx.font = `bold ${Math.max(11, Math.min(16, ts(bb.w)/8))}px sans-serif`
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+      ctx.fillText(room.name, cx, cy - 8)
+      if (room.label) {
+        ctx.font = `${Math.max(9, Math.min(13, ts(bb.w)/10))}px sans-serif`
+        ctx.fillStyle = '#6b7280'
+        ctx.fillText(room.label, cx, cy + 10)
+      }
+    })
+
+    // ── Dimension lines ──────────────────────────────────────────────────
+    if (showDimensions) {
+      const DOFF = 18
       const TICK = 6
-      const lineColor = '#2563eb'
-      const textColor = '#1e3a5f'
-
-      // Get floorplan bounds to clamp labels inside drawing area
-      const fpb = analysis.floorplan_bounds
-      const minY = fpb ? py(fpb.y) : 0
-      const maxY = fpb ? py(fpb.y + fpb.h) : dH
-      const minX = fpb ? px(fpb.x) : 0
-      const maxX = fpb ? px(fpb.x + fpb.w) : dW
-
-      // Deduplicate: track drawn dimension lines by key to avoid drawing same wall twice
       const drawnDims = new Set()
 
       rooms.forEach(room => {
         const bb = room.bounding_box
         if (!bb) return
         const isHov = hoveredId === room.name
-        const color = isHov ? '#185FA5' : lineColor
-        const tcolor = isHov ? '#0C447C' : textColor
 
         room.walls?.forEach(wall => {
           if (!wall.length_m || isNaN(wall.length_m)) return
           const side = wall.side
-
-          // Wall endpoints from bounding box
-          let wx1, wy1, wx2, wy2
-          if (side === 'north')      { wx1 = px(bb.x); wy1 = py(bb.y);       wx2 = px(bb.x+bb.w); wy2 = py(bb.y) }
-          else if (side === 'south') { wx1 = px(bb.x); wy1 = py(bb.y+bb.h);  wx2 = px(bb.x+bb.w); wy2 = py(bb.y+bb.h) }
-          else if (side === 'west')  { wx1 = px(bb.x); wy1 = py(bb.y);       wx2 = px(bb.x);      wy2 = py(bb.y+bb.h) }
-          else                       { wx1 = px(bb.x+bb.w); wy1 = py(bb.y);  wx2 = px(bb.x+bb.w); wy2 = py(bb.y+bb.h) }
-
-          // Clamp wall endpoints to floorplan bounds — prevents bleeding into black border
-          wx1 = Math.max(minX, Math.min(maxX, wx1))
-          wy1 = Math.max(minY, Math.min(maxY, wy1))
-          wx2 = Math.max(minX, Math.min(maxX, wx2))
-          wy2 = Math.max(minY, Math.min(maxY, wy2))
-
-          // Deduplicate by rounded wall position + side
-          const dimKey = `${Math.round(wx1)},${Math.round(wy1)},${Math.round(wx2)},${Math.round(wy2)}`
-          if (drawnDims.has(dimKey)) return
-          drawnDims.add(dimKey)
-
           const lbl = wall.length_m.toFixed(2) + 'm'
-          const isHoriz = (side === 'north' || side === 'south')
 
-          // Offset dimension line away from wall — always toward OUTSIDE of room
+          let wx1, wy1, wx2, wy2
+          if (side === 'north')      { wx1=tx(bb.x); wy1=ty(bb.y);      wx2=tx(bb.x+bb.w); wy2=ty(bb.y) }
+          else if (side === 'south') { wx1=tx(bb.x); wy1=ty(bb.y+bb.h); wx2=tx(bb.x+bb.w); wy2=ty(bb.y+bb.h) }
+          else if (side === 'west')  { wx1=tx(bb.x); wy1=ty(bb.y);      wx2=tx(bb.x);      wy2=ty(bb.y+bb.h) }
+          else                       { wx1=tx(bb.x+bb.w); wy1=ty(bb.y); wx2=tx(bb.x+bb.w); wy2=ty(bb.y+bb.h) }
+
+          const key = `${Math.round(wx1)},${Math.round(wy1)},${Math.round(wx2)},${Math.round(wy2)}`
+          if (drawnDims.has(key)) return
+          drawnDims.add(key)
+
+          const isHoriz = side === 'north' || side === 'south'
           let dx1, dy1, dx2, dy2, angle
-          if (side === 'north') {
-            dy1 = Math.max(minY + 2, wy1 - OFFSET)
-            dx1 = wx1; dx2 = wx2; dy2 = dy1; angle = 0
-          } else if (side === 'south') {
-            dy1 = Math.min(maxY - 2, wy1 + OFFSET)
-            dx1 = wx1; dx2 = wx2; dy2 = dy1; angle = 0
-          } else if (side === 'west') {
-            dx1 = Math.max(minX + 2, wx1 - OFFSET)
-            dy1 = wy1; dy2 = wy2; dx2 = dx1; angle = -Math.PI/2
-          } else {
-            dx1 = Math.min(maxX - 2, wx1 + OFFSET)
-            dy1 = wy1; dy2 = wy2; dx2 = dx1; angle = -Math.PI/2
-          }
+          if (side === 'north')      { dx1=wx1; dy1=wy1-DOFF; dx2=wx2; dy2=wy2-DOFF; angle=0 }
+          else if (side === 'south') { dx1=wx1; dy1=wy1+DOFF; dx2=wx2; dy2=wy2+DOFF; angle=0 }
+          else if (side === 'west')  { dx1=wx1-DOFF; dy1=wy1; dx2=wx2-DOFF; dy2=wy2; angle=-Math.PI/2 }
+          else                       { dx1=wx1+DOFF; dy1=wy1; dx2=wx2+DOFF; dy2=wy2; angle=-Math.PI/2 }
 
-          const midX = (dx1 + dx2) / 2
-          const midY = (dy1 + dy2) / 2
+          const midX=(dx1+dx2)/2, midY=(dy1+dy2)/2
+          const color = isHov ? '#185FA5' : '#2563eb'
 
-          // Extension lines (dashed)
-          ctx.strokeStyle = color + '77'
-          ctx.lineWidth = 0.8
-          ctx.setLineDash([3, 3])
-          ctx.beginPath()
-          ctx.moveTo(wx1, wy1); ctx.lineTo(dx1, dy1)
-          ctx.moveTo(wx2, wy2); ctx.lineTo(dx2, dy2)
-          ctx.stroke()
-          ctx.setLineDash([])
+          // Extension lines
+          ctx.strokeStyle = color+'88'; ctx.lineWidth=0.8; ctx.setLineDash([3,3])
+          ctx.beginPath(); ctx.moveTo(wx1,wy1); ctx.lineTo(dx1,dy1)
+          ctx.moveTo(wx2,wy2); ctx.lineTo(dx2,dy2); ctx.stroke(); ctx.setLineDash([])
 
-          // Main dimension line
-          ctx.strokeStyle = color
-          ctx.lineWidth = 1.5
-          ctx.beginPath()
-          ctx.moveTo(dx1, dy1); ctx.lineTo(dx2, dy2)
-          ctx.stroke()
+          // Dimension line
+          ctx.strokeStyle = color; ctx.lineWidth=1.5
+          ctx.beginPath(); ctx.moveTo(dx1,dy1); ctx.lineTo(dx2,dy2); ctx.stroke()
 
-          // Slash tick marks at ends
-          ctx.lineWidth = 1.5
-          ctx.beginPath()
+          // Ticks
+          ctx.lineWidth=1.5; ctx.beginPath()
           if (isHoriz) {
-            ctx.moveTo(dx1-4, dy1-TICK); ctx.lineTo(dx1+4, dy1+TICK)
-            ctx.moveTo(dx2-4, dy2-TICK); ctx.lineTo(dx2+4, dy2+TICK)
+            ctx.moveTo(dx1-4,dy1-TICK); ctx.lineTo(dx1+4,dy1+TICK)
+            ctx.moveTo(dx2-4,dy2-TICK); ctx.lineTo(dx2+4,dy2+TICK)
           } else {
-            ctx.moveTo(dx1-TICK, dy1-4); ctx.lineTo(dx1+TICK, dy1+4)
-            ctx.moveTo(dx2-TICK, dy2-4); ctx.lineTo(dx2+TICK, dy2+4)
+            ctx.moveTo(dx1-TICK,dy1-4); ctx.lineTo(dx1+TICK,dy1+4)
+            ctx.moveTo(dx2-TICK,dy2-4); ctx.lineTo(dx2+TICK,dy2+4)
           }
           ctx.stroke()
 
-          // Label pill — white background, border, rotated for vertical
-          ctx.save()
-          ctx.translate(midX, midY)
-          ctx.rotate(angle)
-          ctx.font = '500 11px sans-serif'
-          ctx.textAlign = 'center'
-          ctx.textBaseline = 'middle'
-          const tw = ctx.measureText(lbl).width + 10
-          ctx.fillStyle = 'rgba(255,255,255,0.96)'
-          ctx.beginPath()
-          ctx.roundRect(-tw/2, -8, tw, 16, 3)
-          ctx.fill()
-          ctx.strokeStyle = color + '55'
-          ctx.lineWidth = 0.5
-          ctx.stroke()
-          ctx.fillStyle = tcolor
-          ctx.fillText(lbl, 0, 0)
-          ctx.restore()
+          // Label
+          ctx.save(); ctx.translate(midX,midY); ctx.rotate(angle)
+          ctx.font='500 11px sans-serif'; ctx.textAlign='center'; ctx.textBaseline='middle'
+          const tw=ctx.measureText(lbl).width+10
+          ctx.fillStyle='rgba(255,255,255,0.96)'; ctx.beginPath()
+          ctx.roundRect(-tw/2,-8,tw,16,3); ctx.fill()
+          ctx.strokeStyle=color+'55'; ctx.lineWidth=0.5; ctx.stroke()
+          ctx.fillStyle=color; ctx.fillText(lbl,0,0); ctx.restore()
         })
       })
     }
 
-    // ── Doors ────────────────────────────────────────────────────────────
-    if (showDoors) {
-      doors.forEach(door => {
-        const isHov = hoveredId === door.id
-        const isVert = door.wall_orientation === 'vertical'
-
-        // Bug 2 fix: use average scale so arc stays circular
-        const avgScale = (scX + scY) / 2
-        const arcCx = px(door.arc_center_x)
-        const arcCy = py(door.arc_center_y)
-        const arcR  = door.arc_radius_px * avgScale
-        const startRad = (door.arc_start_deg ?? 0)  * Math.PI / 180
-        const endRad   = (door.arc_end_deg   ?? 90) * Math.PI / 180
-
-        ctx.strokeStyle = isHov ? '#E24B4A' : '#E24B4Acc'
-        ctx.lineWidth = isHov ? 3 : 2.5
-        ctx.setLineDash([5, 3])
-        ctx.beginPath()
-        ctx.arc(arcCx, arcCy, arcR, startRad, endRad)
-        ctx.stroke()
-        ctx.setLineDash([])
-
-        // Bug 4 fix: gap bracket direction respects wall_orientation
-        ctx.strokeStyle = isHov ? '#E24B4A' : '#E24B4Acc'
-        ctx.lineWidth = isHov ? 4 : 3
-        const gx1 = px(door.gap_x)
-        const gy1 = py(door.gap_y)
-        const gx2 = isVert ? px(door.gap_x)                    : px(door.gap_x + door.gap_width_px)
-        const gy2 = isVert ? py(door.gap_y + door.gap_width_px): py(door.gap_y)
-
-        ctx.beginPath()
-        if (isVert) {
-          ctx.moveTo(gx1 - 4, gy1); ctx.lineTo(gx1 + 4, gy1)
-          ctx.moveTo(gx2 - 4, gy2); ctx.lineTo(gx2 + 4, gy2)
-        } else {
-          ctx.moveTo(gx1, gy1 - 4); ctx.lineTo(gx1, gy1 + 4)
-          ctx.moveTo(gx2, gy2 - 4); ctx.lineTo(gx2, gy2 + 4)
-        }
-        ctx.stroke()
-
-        const lx = (gx1 + gx2) / 2
-        const ly = (gy1 + gy2) / 2 - 14
-        const lbl = door.id
-        const tw = lbl.length * 7 + 10
-        ctx.fillStyle = isHov ? '#A32D2D' : '#E24B4A'
-        ctx.beginPath()
-        ctx.roundRect(lx - tw / 2, ly - 9, tw, 18, 4)
-        ctx.fill()
-        ctx.fillStyle = '#fff'
-        ctx.font = 'bold 11px sans-serif'
-        ctx.textAlign = 'center'
-        ctx.textBaseline = 'middle'
-        ctx.fillText(lbl, lx, ly)
-      })
-    }
-
-    // ── Passages ─────────────────────────────────────────────────────────
-    if (showPassages) {
-      passages.forEach(p => {
-        const isHov = hoveredId === p.id
-        const isVert = p.wall_orientation === 'vertical'
-
-        ctx.strokeStyle = isHov ? '#1D9E75' : '#1D9E7599'
-        ctx.lineWidth = isHov ? 3 : 2
-        ctx.setLineDash([4, 3])
-        const gx1 = px(p.gap_x)
-        const gy1 = py(p.gap_y)
-        const gx2 = isVert ? px(p.gap_x)                   : px(p.gap_x + p.gap_width_px)
-        const gy2 = isVert ? py(p.gap_y + p.gap_width_px)  : py(p.gap_y)
-
-        ctx.beginPath()
-        ctx.moveTo(gx1, gy1)
-        ctx.lineTo(gx2, gy2)
-        ctx.stroke()
-        ctx.setLineDash([])
-
-        const lx = (gx1 + gx2) / 2
-        const ly = (gy1 + gy2) / 2 - 14
-        const lbl = p.id
-        const tw = lbl.length * 7 + 10
-        ctx.fillStyle = isHov ? '#0F6E56' : '#1D9E75'
-        ctx.beginPath()
-        ctx.roundRect(lx - tw / 2, ly - 9, tw, 18, 4)
-        ctx.fill()
-        ctx.fillStyle = '#fff'
-        ctx.font = 'bold 11px sans-serif'
-        ctx.textAlign = 'center'
-        ctx.textBaseline = 'middle'
-        ctx.fillText(lbl, lx, ly)
-      })
-    }
-
-    // ── Windows ───────────────────────────────────────────────────────────
-    if (showWindows) {
-      windows.forEach(w => {
-        const isHov = hoveredId === w.id
-        const isVert = w.wall_orientation === 'vertical'
-        const cx = px(w.center_x)
-        const cy = py(w.center_y)
-        const halfW = px(w.width_px) / 2
-
-        ctx.strokeStyle = isHov ? '#BA7517' : '#BA751799'
-        ctx.lineWidth = isHov ? 4 : 3
-        ctx.beginPath()
-        if (isVert) {
-          ctx.moveTo(cx, cy - halfW); ctx.lineTo(cx, cy + halfW)
-          ctx.moveTo(cx - 5, cy - halfW); ctx.lineTo(cx + 5, cy - halfW)
-          ctx.moveTo(cx - 5, cy + halfW); ctx.lineTo(cx + 5, cy + halfW)
-        } else {
-          ctx.moveTo(cx - halfW, cy); ctx.lineTo(cx + halfW, cy)
-          ctx.moveTo(cx - halfW, cy - 5); ctx.lineTo(cx - halfW, cy + 5)
-          ctx.moveTo(cx + halfW, cy - 5); ctx.lineTo(cx + halfW, cy + 5)
-        }
-        ctx.stroke()
-
-        const lbl = w.id
-        const tw = lbl.length * 7 + 10
-        const labelY = isVert ? cy : cy - 16
-        ctx.fillStyle = isHov ? '#854F0B' : '#BA7517'
-        ctx.beginPath()
-        ctx.roundRect(cx - tw / 2, labelY - 9, tw, 16, 3)
-        ctx.fill()
-        ctx.fillStyle = '#fff'
-        ctx.font = 'bold 10px sans-serif'
-        ctx.textAlign = 'center'
-        ctx.textBaseline = 'middle'
-        ctx.fillText(lbl, cx, labelY)
-      })
-    }
+    // ── Compass / north arrow ────────────────────────────────────────────
+    ctx.fillStyle = '#9ca3af'
+    ctx.font = '11px sans-serif'
+    ctx.textAlign = 'right'
+    ctx.fillText('N ↑', canvas.width - 8, 20)
   }
 
-  const cal      = analysis?.calibration
+    const cal      = analysis?.calibration
   const doors    = analysis?.doors    || []
   const passages = analysis?.passages || []
   const windows  = analysis?.windows  || []
@@ -574,9 +554,15 @@ export default function FloorPlanAnalyzer() {
                   src={image}
                   alt="Floor plan"
                   className="fpa-img"
+                  style={{ display: analysis ? 'none' : 'block' }}
                   onLoad={onImgLoad}
                 />
-                <canvas ref={canvasRef} className="fpa-overlay" />
+                {analysis && (
+                  <canvas ref={canvasRef} className="fpa-drawn-plan" />
+                )}
+                {!analysis && (
+                  <canvas ref={canvasRef} style={{display:'none'}} />
+                )}
               </div>
             </div>
           )}
