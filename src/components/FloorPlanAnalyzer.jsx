@@ -5,37 +5,39 @@ const MODEL = 'claude-sonnet-4-20250514'
 
 const ANALYSIS_PROMPT = `You are an expert floor plan analyzer with perfect spatial reasoning.
 
-CRITICAL FIRST STEP — CROP TO ACTUAL FLOOR PLAN:
-Many floor plan photos have large black or white borders/padding around the actual drawing.
-Before measuring ANYTHING, identify the bounding box of the actual floor plan drawing itself.
-ALL pixel coordinates you return must be relative to the TOP-LEFT CORNER OF THE FULL IMAGE (0,0 = top-left pixel of the uploaded image).
-Do NOT re-number coordinates after mentally cropping — use full image pixel coordinates throughout.
+CRITICAL FIRST STEP — FIND THE ACTUAL FLOOR PLAN AREA:
+The image may have large black borders/padding. Identify where the actual floor plan drawing starts and ends.
+ALL pixel coordinates must be relative to the TOP-LEFT of the FULL image (0,0 = top-left pixel).
 
-YOUR TASKS:
+STEP 1 — CALIBRATION:
+- Find ALL rooms/spaces that have written dimensions inside them (e.g. "5 x 6m", "2.8 x 3.6m", "6 x 3m")
+- Use the Living room (5 x 6m) or largest labeled room for calibration
+- Measure that room's SHORT wall carefully in pixels
+- pixels_per_meter = short_side_pixels / short_side_meters
+- Verify: long_side_pixels should equal long_side_meters × pixels_per_meter
 
-1. CALIBRATION
-   - Find all labeled rooms with written dimensions (e.g. "3x4m", "5 x 6m", "2.8 x 3.6m")
-   - Pick the LARGEST clearly labeled room for best accuracy (more pixels = more precise ratio)
-   - Carefully measure that room's SHORT wall in pixels in the full image
-   - pixels_per_meter = short_side_pixels / short_side_label_m
-   - Double-check: does the long side = long_side_label_m x pixels_per_meter? Adjust if not.
+STEP 2 — MAP EVERY SINGLE ROOM (critical — do not skip any):
+List EVERY space visible: bedrooms, bathroom, kitchen, laundry, living, dining, robe/wardrobe, linen, balcony, garage, entry, corridor — ALL of them.
+For each room provide:
+- Exact bounding_box in full-image pixels (x, y, w, h)
+- ALL 4 walls (north/south/east/west) with pixel length and meter length
+- Walls that are shared between rooms still get measured individually per room
 
-2. DOOR DETECTION — distinguish each type carefully:
-   A. SWING DOOR: gap in wall PLUS a quarter-circle arc. Arc pivots from one end of the gap.
-      - arc_center_x/y = the hinge point (one end of the gap, full image coords)
-      - arc_radius_px = gap width in pixels (= door panel length)
-      - arc_start_deg / arc_end_deg = angular sweep (e.g. 0->90, 90->180, 180->270, 270->360)
-      - wall_orientation: "horizontal" if wall runs left-right, "vertical" if wall runs top-bottom
-   B. OPEN PASSAGE: gap in wall with NO arc. Wardrobe entries, open archways.
-   C. SLIDING or BIFOLD: gap with parallel lines. Often balcony/patio access.
-   D. WINDOW: gap in EXTERIOR (outer perimeter) wall with double-line sill. NOT a door.
+STEP 3 — DOOR DETECTION:
+A. SWING DOOR: gap in wall + quarter-circle arc drawn from one end
+   - arc_center_x/y = hinge point (full image coords)
+   - arc_radius_px = door width in pixels
+   - arc_start_deg/arc_end_deg = sweep angle
+   - wall_orientation: "horizontal" or "vertical"
+B. OPEN PASSAGE: gap with NO arc (wardrobe entries, open archways)
+C. WINDOW: gap in exterior wall with double sill line
 
-3. WALL MEASUREMENTS
-   - Measure every wall of every room in pixels, convert to meters using calibration
-   - Gaps (doors/windows) are INCLUDED in total wall length
-   - All bounding_box coordinates are full image pixel coordinates
+STEP 4 — DIMENSION LINES (important for drawing):
+For each wall, also provide the actual start and end pixel coordinates of that wall edge so dimension lines can be drawn precisely:
+- wall_x1, wall_y1 = start point of wall in full image pixels
+- wall_x2, wall_y2 = end point of wall in full image pixels
 
-Return ONLY valid JSON — no markdown, no backticks, no explanation, nothing before or after the JSON:
+Return ONLY valid JSON, nothing else:
 
 {
   "calibration": {
@@ -48,20 +50,17 @@ Return ONLY valid JSON — no markdown, no backticks, no explanation, nothing be
     "pixels_per_meter": 56.0,
     "confidence": "high"
   },
-  "floorplan_bounds": {
-    "x": 60, "y": 420, "w": 550, "h": 650,
-    "note": "Actual floor plan drawing region in the full image"
-  },
+  "floorplan_bounds": { "x": 60, "y": 420, "w": 550, "h": 650 },
   "rooms": [
     {
       "name": "Living",
       "label": "5 x 6m",
       "bounding_box": { "x": 190, "y": 580, "w": 280, "h": 336 },
       "walls": [
-        { "side": "north", "length_px": 280, "length_m": 5.0, "has_door": true,  "has_window": false },
-        { "side": "east",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": false },
-        { "side": "south", "length_px": 280, "length_m": 5.0, "has_door": false, "has_window": false },
-        { "side": "west",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": true  }
+        { "side": "north", "length_px": 280, "length_m": 5.0, "has_door": true,  "has_window": false, "wall_x1": 190, "wall_y1": 580, "wall_x2": 470, "wall_y2": 580 },
+        { "side": "east",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": false, "wall_x1": 470, "wall_y1": 580, "wall_x2": 470, "wall_y2": 916 },
+        { "side": "south", "length_px": 280, "length_m": 5.0, "has_door": false, "has_window": false, "wall_x1": 190, "wall_y1": 916, "wall_x2": 470, "wall_y2": 916 },
+        { "side": "west",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": true,  "wall_x1": 190, "wall_y1": 580, "wall_x2": 190, "wall_y2": 916 }
       ]
     }
   ],
@@ -71,42 +70,30 @@ Return ONLY valid JSON — no markdown, no backticks, no explanation, nothing be
       "type": "swing",
       "wall_orientation": "horizontal",
       "location": "Bed 2 south wall into corridor",
-      "gap_x": 120,
-      "gap_y": 490,
-      "gap_width_px": 52,
-      "gap_width_m": 0.93,
-      "arc_center_x": 120,
-      "arc_center_y": 490,
-      "arc_radius_px": 52,
-      "arc_start_deg": 0,
-      "arc_end_deg": 90,
+      "gap_x": 120, "gap_y": 490,
+      "gap_width_px": 52, "gap_width_m": 0.93,
+      "arc_center_x": 120, "arc_center_y": 490,
+      "arc_radius_px": 52, "arc_start_deg": 0, "arc_end_deg": 90,
       "connects": ["Bed 2", "Corridor"]
     }
   ],
   "passages": [
     {
-      "id": "P1",
-      "wall_orientation": "horizontal",
-      "location": "Robe entry from Bed 2",
-      "gap_x": 90,
-      "gap_y": 520,
-      "gap_width_px": 40,
-      "gap_width_m": 0.71,
+      "id": "P1", "wall_orientation": "horizontal",
+      "location": "Robe entry", "gap_x": 90, "gap_y": 520,
+      "gap_width_px": 40, "gap_width_m": 0.71,
       "connects": ["Bed 2", "Robe"]
     }
   ],
   "windows": [
     {
-      "id": "W1",
-      "location": "North exterior wall of Bed 1",
+      "id": "W1", "location": "North wall Bed 1",
       "wall_orientation": "horizontal",
-      "center_x": 395,
-      "center_y": 418,
-      "width_px": 60,
-      "width_m": 1.07
+      "center_x": 395, "center_y": 418,
+      "width_px": 60, "width_m": 1.07
     }
   ],
-  "summary": "Calibrated via Living (5x6m = 280x336px = 56px/m). Found 5 swing doors, 3 open passages, 4 windows."
+  "summary": "Found all rooms. Calibrated via Living 5x6m."
 }`
 
 export default function FloorPlanAnalyzer() {
@@ -246,103 +233,95 @@ export default function FloorPlanAnalyzer() {
 
     const { doors = [], passages = [], windows = [], rooms = [] } = analysis
 
-    // ── Dimension overlays — parallel to walls, architectural style ────────
+    // ── Dimension overlays — precise architectural style ────────────────────
     if (showDimensions && rooms.length > 0) {
-      const OFFSET = 18   // px gap between wall edge and dimension line
-      const TICK   = 6    // half-length of end tick marks
+      const OFFSET = 22
+      const TICK = 7
 
       rooms.forEach(room => {
         const bb = room.bounding_box
         if (!bb) return
         const isHov = hoveredId === room.name
-        const lineColor = isHov ? '#185FA5' : '#378ADD'
-        const textColor = isHov ? '#0C447C' : '#185FA5'
+        const lineColor = isHov ? '#185FA5' : '#2563eb'
+        const textColor = isHov ? '#0C447C' : '#1e3a5f'
 
         room.walls?.forEach(wall => {
           if (!wall.length_m || isNaN(wall.length_m)) return
           const lbl = wall.length_m.toFixed(2) + 'm'
           const side = wall.side
 
-          // Compute the two endpoints of the dimension line, offset from the wall
-          let x1, y1, x2, y2, midX, midY, angle
-
-          if (side === 'north') {
-            x1 = px(bb.x);        y1 = py(bb.y) - OFFSET
-            x2 = px(bb.x + bb.w); y2 = py(bb.y) - OFFSET
-            midX = (x1 + x2) / 2; midY = y1
-            angle = 0
-          } else if (side === 'south') {
-            x1 = px(bb.x);        y1 = py(bb.y + bb.h) + OFFSET
-            x2 = px(bb.x + bb.w); y2 = py(bb.y + bb.h) + OFFSET
-            midX = (x1 + x2) / 2; midY = y1
-            angle = 0
-          } else if (side === 'west') {
-            x1 = px(bb.x) - OFFSET; y1 = py(bb.y)
-            x2 = px(bb.x) - OFFSET; y2 = py(bb.y + bb.h)
-            midX = x1; midY = (y1 + y2) / 2
-            angle = -Math.PI / 2
-          } else { // east
-            x1 = px(bb.x + bb.w) + OFFSET; y1 = py(bb.y)
-            x2 = px(bb.x + bb.w) + OFFSET; y2 = py(bb.y + bb.h)
-            midX = x1; midY = (y1 + y2) / 2
-            angle = -Math.PI / 2
+          // Use precise wall coords if available, fallback to bounding box
+          let wx1, wy1, wx2, wy2
+          if (wall.wall_x1 != null) {
+            wx1 = px(wall.wall_x1); wy1 = py(wall.wall_y1)
+            wx2 = px(wall.wall_x2); wy2 = py(wall.wall_y2)
+          } else {
+            if (side === 'north')      { wx1 = px(bb.x); wy1 = py(bb.y);        wx2 = px(bb.x+bb.w); wy2 = py(bb.y) }
+            else if (side === 'south') { wx1 = px(bb.x); wy1 = py(bb.y+bb.h);   wx2 = px(bb.x+bb.w); wy2 = py(bb.y+bb.h) }
+            else if (side === 'west')  { wx1 = px(bb.x); wy1 = py(bb.y);        wx2 = px(bb.x);       wy2 = py(bb.y+bb.h) }
+            else                       { wx1 = px(bb.x+bb.w); wy1 = py(bb.y);   wx2 = px(bb.x+bb.w); wy2 = py(bb.y+bb.h) }
           }
 
-          // Draw dimension line
+          // Dimension line offset direction
+          let dx1, dy1, dx2, dy2, angle
+          const isHoriz = (side === 'north' || side === 'south')
+          if (side === 'north') {
+            dx1 = wx1; dy1 = wy1 - OFFSET; dx2 = wx2; dy2 = wy2 - OFFSET; angle = 0
+          } else if (side === 'south') {
+            dx1 = wx1; dy1 = wy1 + OFFSET; dx2 = wx2; dy2 = wy2 + OFFSET; angle = 0
+          } else if (side === 'west') {
+            dx1 = wx1 - OFFSET; dy1 = wy1; dx2 = wx2 - OFFSET; dy2 = wy2; angle = -Math.PI/2
+          } else {
+            dx1 = wx1 + OFFSET; dy1 = wy1; dx2 = wx2 + OFFSET; dy2 = wy2; angle = -Math.PI/2
+          }
+
+          const midX = (dx1 + dx2) / 2
+          const midY = (dy1 + dy2) / 2
+
+          // Extension lines
+          ctx.strokeStyle = lineColor + '88'
+          ctx.lineWidth = 1
+          ctx.setLineDash([4, 3])
+          ctx.beginPath()
+          ctx.moveTo(wx1, wy1); ctx.lineTo(dx1, dy1)
+          ctx.moveTo(wx2, wy2); ctx.lineTo(dx2, dy2)
+          ctx.stroke()
+          ctx.setLineDash([])
+
+          // Dimension line
           ctx.strokeStyle = lineColor
           ctx.lineWidth = 1.5
-          ctx.setLineDash([])
           ctx.beginPath()
-          ctx.moveTo(x1, y1)
-          ctx.lineTo(x2, y2)
+          ctx.moveTo(dx1, dy1); ctx.lineTo(dx2, dy2)
           ctx.stroke()
 
-          // Draw tick marks at both ends (perpendicular to wall)
+          // Tick marks (45-degree slash style)
           ctx.lineWidth = 1.5
           ctx.beginPath()
-          if (side === 'north' || side === 'south') {
-            ctx.moveTo(x1, y1 - TICK); ctx.lineTo(x1, y1 + TICK)
-            ctx.moveTo(x2, y2 - TICK); ctx.lineTo(x2, y2 + TICK)
+          if (isHoriz) {
+            ctx.moveTo(dx1 - 4, dy1 - TICK); ctx.lineTo(dx1 + 4, dy1 + TICK)
+            ctx.moveTo(dx2 - 4, dy2 - TICK); ctx.lineTo(dx2 + 4, dy2 + TICK)
           } else {
-            ctx.moveTo(x1 - TICK, y1); ctx.lineTo(x1 + TICK, y1)
-            ctx.moveTo(x2 - TICK, y2); ctx.lineTo(x2 + TICK, y2)
+            ctx.moveTo(dx1 - TICK, dy1 - 4); ctx.lineTo(dx1 + TICK, dy1 + 4)
+            ctx.moveTo(dx2 - TICK, dy2 - 4); ctx.lineTo(dx2 + TICK, dy2 + 4)
           }
           ctx.stroke()
 
-          // Draw extension lines from wall corners to dimension line
-          ctx.strokeStyle = lineColor + '66'
-          ctx.lineWidth = 1
-          ctx.setLineDash([3, 3])
-          ctx.beginPath()
-          if (side === 'north') {
-            ctx.moveTo(x1, py(bb.y)); ctx.lineTo(x1, y1)
-            ctx.moveTo(x2, py(bb.y)); ctx.lineTo(x2, y2)
-          } else if (side === 'south') {
-            ctx.moveTo(x1, py(bb.y + bb.h)); ctx.lineTo(x1, y1)
-            ctx.moveTo(x2, py(bb.y + bb.h)); ctx.lineTo(x2, y2)
-          } else if (side === 'west') {
-            ctx.moveTo(px(bb.x), y1); ctx.lineTo(x1, y1)
-            ctx.moveTo(px(bb.x), y2); ctx.lineTo(x2, y2)
-          } else {
-            ctx.moveTo(px(bb.x + bb.w), y1); ctx.lineTo(x1, y1)
-            ctx.moveTo(px(bb.x + bb.w), y2); ctx.lineTo(x2, y2)
-          }
-          ctx.stroke()
-          ctx.setLineDash([])
-
-          // Draw label — rotated for vertical walls
+          // Label — rotated for vertical walls
           ctx.save()
           ctx.translate(midX, midY)
           ctx.rotate(angle)
-          ctx.font = `500 11px sans-serif`
+          ctx.font = '500 11px sans-serif'
           ctx.textAlign = 'center'
           ctx.textBaseline = 'middle'
-          const tw = ctx.measureText(lbl).width + 8
-          // White background pill behind text
-          ctx.fillStyle = 'rgba(255,255,255,0.92)'
+          const tw = ctx.measureText(lbl).width + 10
+          ctx.fillStyle = 'rgba(255,255,255,0.95)'
           ctx.beginPath()
-          ctx.roundRect(-tw / 2, -9, tw, 18, 3)
+          ctx.roundRect(-tw/2, -9, tw, 18, 3)
           ctx.fill()
+          ctx.strokeStyle = lineColor + '66'
+          ctx.lineWidth = 0.5
+          ctx.stroke()
           ctx.fillStyle = textColor
           ctx.fillText(lbl, 0, 0)
           ctx.restore()
