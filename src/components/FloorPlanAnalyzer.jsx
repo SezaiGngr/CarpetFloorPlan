@@ -97,95 +97,8 @@ function detectWalls(imageData, width, height) {
   var mergedH = mergeSegments(hSegs, 'h', 6)
   var mergedV = mergeSegments(vSegs, 'v', 6)
 
-  // ── Close exterior wall gaps (windows) ─────────────────────────────
-  mergedH = closeExteriorGaps(mergedH, mergedV, 'h')
-  mergedV = closeExteriorGaps(mergedV, mergedH, 'v')
-
   return { horizontal: mergedH, vertical: mergedV }
 }
-
-// ─── CLOSE GAPS IN EXTERIOR WALLS ────────────────────────────────────────────
-// Exterior walls are the outermost wall lines. Windows create gaps in them.
-// We find which wall positions are on the exterior boundary and bridge all gaps.
-
-function closeExteriorGaps(walls, crossWalls, axis) {
-  if (walls.length === 0) return walls
-
-  // Find the bounding box from ALL walls (both axes)
-  var allPositions = walls.map(function(w) { return axis === 'h' ? w.y1 : w.x1 })
-  var crossPositions = crossWalls.map(function(w) { return axis === 'h' ? w.x1 : w.y1 })
-
-  var allPos = allPositions.concat([])
-  var minPos = Math.min.apply(null, allPos)
-  var maxPos = Math.max.apply(null, allPos)
-
-  // Find all cross-wall extents to know the full span
-  var allCrossCoords = []
-  crossWalls.forEach(function(w) {
-    if (axis === 'h') {
-      allCrossCoords.push(w.x1, w.x2)
-    } else {
-      allCrossCoords.push(w.y1, w.y2)
-    }
-  })
-  walls.forEach(function(w) {
-    if (axis === 'h') {
-      allCrossCoords.push(w.x1, w.x2)
-    } else {
-      allCrossCoords.push(w.y1, w.y2)
-    }
-  })
-
-  var EXTERIOR_TOL = 15 // pixels from boundary to be considered exterior
-
-  // Group walls by position (same y for horizontal, same x for vertical)
-  var groups = {}
-  walls.forEach(function(w) {
-    var pos = axis === 'h' ? w.y1 : w.x1
-    var key = Math.round(pos / 8) * 8 // cluster nearby positions
-    if (!groups[key]) groups[key] = { pos: pos, segs: [], count: 0 }
-    groups[key].count++
-    groups[key].pos = groups[key].pos + (pos - groups[key].pos) / groups[key].count
-    groups[key].segs.push(w)
-  })
-
-  var result = []
-
-  Object.keys(groups).forEach(function(key) {
-    var group = groups[key]
-    var pos = group.pos
-    var segs = group.segs
-
-    // Is this an exterior wall position?
-    var isExterior = Math.abs(pos - minPos) < EXTERIOR_TOL || Math.abs(pos - maxPos) < EXTERIOR_TOL
-
-    if (isExterior && segs.length > 1) {
-      // Bridge all gaps: find min start and max end, make one continuous wall
-      var minA = Infinity, maxB = -Infinity
-      segs.forEach(function(s) {
-        if (axis === 'h') {
-          minA = Math.min(minA, s.x1)
-          maxB = Math.max(maxB, s.x2)
-        } else {
-          minA = Math.min(minA, s.y1)
-          maxB = Math.max(maxB, s.y2)
-        }
-      })
-
-      if (axis === 'h') {
-        result.push({ x1: minA, y1: Math.round(pos), x2: maxB, y2: Math.round(pos) })
-      } else {
-        result.push({ x1: Math.round(pos), y1: minA, x2: Math.round(pos), y2: maxB })
-      }
-    } else {
-      // Interior wall or single segment — keep as-is
-      segs.forEach(function(s) { result.push(s) })
-    }
-  })
-
-  return result
-}
-
 
 function mergeSegments(segments, axis, tol) {
   if (segments.length === 0) return []
@@ -318,7 +231,7 @@ export default function FloorPlanAnalyzer() {
         }
       } catch (e2) { console.warn('Label err:', e2) }
 
-      if (!ppm) ppm = estimatePPMFallback(wallData, w, h)
+      if (!ppm) ppm = estimatePPMFallback(wallData)
 
       setAnalysis({
         walls: wallData.horizontal.concat(wallData.vertical),
@@ -359,7 +272,7 @@ export default function FloorPlanAnalyzer() {
     return ppmH
   }
 
-  function estimatePPMFallback(wallData, imgW, imgH) {
+  function estimatePPMFallback(wallData) {
     var all = wallData.horizontal.concat(wallData.vertical)
     if (all.length === 0) return 80
     var minX = Infinity, maxX = -Infinity
@@ -409,8 +322,10 @@ export default function FloorPlanAnalyzer() {
       ctx.stroke()
     })
 
-    // Dimension labels on every wall
+    // Dimension labels on every wall segment
     var MIN_LABEL_PX = 30
+    ctx.fillStyle = '#2563eb'
+
     allWalls.forEach(function(w) {
       var dx = w.x2 - w.x1, dy = w.y2 - w.y1
       var lenPx = Math.sqrt(dx * dx + dy * dy)
@@ -423,7 +338,6 @@ export default function FloorPlanAnalyzer() {
       ctx.font = fontSize + 'px "Segoe UI", system-ui, sans-serif'
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
-      ctx.fillStyle = '#2563eb'
 
       var mx = X((w.x1 + w.x2) / 2)
       var my = Y((w.y1 + w.y2) / 2)
@@ -439,6 +353,7 @@ export default function FloorPlanAnalyzer() {
       }
     })
 
+    // North arrow
     ctx.fillStyle = '#9ca3af'
     ctx.font = '11px sans-serif'
     ctx.textAlign = 'right'
@@ -491,7 +406,7 @@ export default function FloorPlanAnalyzer() {
         <div className="fpa-loading">
           <div className="fpa-spinner" />
           <p>Processing floor plan&hellip;</p>
-          <p className="fpa-loading-sub">Scanning pixels, closing window gaps</p>
+          <p className="fpa-loading-sub">Scanning pixels for walls, reading labels</p>
         </div>
       )}
 
