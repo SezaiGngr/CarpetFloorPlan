@@ -1,4 +1,4 @@
-import FloorPlanAnalyzer from './components/FloorPlanAnalyzer.jsx'
+import FloorPlanAnalyzer from './components/FloorPlanAnalyzer'
 
 export default function App() {
   return <FloorPlanAnalyzer />
