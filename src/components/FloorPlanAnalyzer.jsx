@@ -2,78 +2,217 @@ import { useState, useRef, useCallback, useEffect } from 'react'
 import './FloorPlanAnalyzer.css'
 
 const MODEL = 'claude-sonnet-4-20250514'
-const MAX_IMG_WIDTH = 1200
+const MAX_IMG_WIDTH = 900
 
 // ─── AI PROMPT ────────────────────────────────────────────────────────────────
-// COMPLETELY NEW APPROACH: Don't try to understand rooms/layout.
-// Instead, trace every wall line and door arc as pixel coordinates.
-// The AI scans the image systematically and reports exact positions.
+// AI is ONLY used for reading text labels and dimensions — NOT for wall positions.
+// Wall detection is done by actual image processing of dark pixels.
 
-const ANALYSIS_PROMPT = `You are analyzing a floor plan image. Your job is to trace EVERY wall line and door arc visible in the image, reporting their EXACT pixel coordinates.
+const LABEL_PROMPT = `Look at this floor plan image. List every text label and dimension annotation you can see.
 
-STEP 1: Report the image dimensions (width x height in pixels).
-
-STEP 2: Find calibration. Look for dimension annotations like "3.7 x 3.7M". Find that room in the image, measure its pixel dimensions, and calculate pixels_per_meter.
-
-STEP 3: Scan the ENTIRE image systematically. Trace every single wall line. Walls appear as thick dark/black lines. Report each wall as a straight line segment with start and end pixel coordinates.
-
-STEP 4: Trace every door. Doors appear as gaps in walls with quarter-circle arc lines. Report the arc center, radius, start angle, and end angle.
-
-STEP 5: Report room labels with their center position in pixels and the text shown.
-
-Return this EXACT JSON format:
-
+Return JSON:
 {
-  "image_width": 800,
-  "image_height": 1000,
-  "pixels_per_meter": 80.5,
-  "walls": [
-    { "x1": 50, "y1": 50, "x2": 350, "y2": 50 },
-    { "x1": 50, "y1": 50, "x2": 50, "y2": 400 }
-  ],
-  "doors": [
-    { "cx": 200, "cy": 300, "radius": 60, "start_deg": 0, "end_deg": 90, "line_to_deg": 90 }
-  ],
   "labels": [
-    { "text": "3.7 x 3.7M", "cx": 180, "cy": 150 },
-    { "text": "BATH", "cx": 150, "cy": 350 }
+    { "text": "3.7 x 3.7M", "type": "dimension" },
+    { "text": "BATH", "type": "room_name" },
+    { "text": "VOID", "type": "room_name" },
+    { "text": "FP", "type": "feature" }
   ]
 }
 
-CRITICAL RULES:
+Include ALL text visible in the image. For dimension labels like "3.7 x 3.7M", type is "dimension".
+For room names like "BATH", "VOID", type is "room_name".
+For other features like "FP" (fireplace), type is "feature".
 
-1. WALLS: Every thick dark line in the floor plan is a wall. Include ALL of them:
-   - All exterior walls (the outer boundary)
-   - All interior walls (dividing rooms)
-   - Even SHORT wall segments (10-20 pixels long) — include them ALL
-   - Walls are STRAIGHT lines, either horizontal or vertical
-   - Where a door gap exists, the wall is split into TWO segments with a gap between them
-   - Report EXACT pixel coordinates for start (x1,y1) and end (x2,y2)
+Return ONLY valid JSON.`
 
-2. SCAN METHOD: Go through the image systematically:
-   - First, trace the entire outer boundary (all exterior walls)
-   - Then scan left-to-right, top-to-bottom for interior walls
-   - For each horizontal wall: report its y-coordinate and the x-range it spans
-   - For each vertical wall: report its x-coordinate and the y-range it spans
-   - Do NOT skip any wall segment, no matter how small
 
-3. DOORS: Quarter-circle arcs that show door swing direction:
-   - "cx", "cy": Center of the arc (the hinge point) in pixels
-   - "radius": The arc radius in pixels (= door width)
-   - "start_deg": Start angle in degrees (0=right, 90=down, 180=left, 270=up)
-   - "end_deg": End angle in degrees
-   - "line_to_deg": Angle for the straight door panel line from center
+// ─── IMAGE PROCESSING: Detect walls from dark pixels ─────────────────────────
 
-4. LABELS: Room name labels with center position in pixels.
+function detectWalls(imageData, width, height) {
+  var data = imageData.data
+  var DARK_THRESHOLD = 80  // pixels darker than this are "wall"
+  var MIN_LINE_LENGTH = 15  // minimum pixels for a wall line
+  var MIN_THICKNESS = 2     // minimum thickness to be considered a wall
+  var MAX_GAP = 3           // max gap to bridge in a line
 
-5. PRECISION: Be as precise as possible with pixel coordinates. Measure from the CENTER of wall lines, not their edges.
+  // Step 1: Build binary mask of dark pixels
+  var mask = new Uint8Array(width * height)
+  for (var i = 0; i < width * height; i++) {
+    var r = data[i * 4]
+    var g = data[i * 4 + 1]
+    var b = data[i * 4 + 2]
+    var a = data[i * 4 + 3]
+    // Dark pixel = wall candidate
+    if (a > 128 && r < DARK_THRESHOLD && g < DARK_THRESHOLD && b < DARK_THRESHOLD) {
+      mask[i] = 1
+    }
+  }
 
-6. DO NOT MISS ANY WALLS. Every line you can see in the image must be in your output.
+  // Step 2: Detect horizontal wall segments
+  // For each row, find runs of dark pixels that are thick enough
+  var hSegments = []
+  for (var y = 1; y < height - 1; y++) {
+    var runStart = -1
+    var gapCount = 0
 
-Return ONLY valid JSON. No markdown, no backticks, no explanation.`
+    for (var x = 0; x < width; x++) {
+      var idx = y * width + x
+      var isDark = mask[idx] === 1
+
+      // Check thickness: at least MIN_THICKNESS rows of dark pixels
+      if (isDark) {
+        var thick = 0
+        for (var dy = -2; dy <= 2; dy++) {
+          var ny = y + dy
+          if (ny >= 0 && ny < height && mask[ny * width + x] === 1) thick++
+        }
+        isDark = thick >= MIN_THICKNESS
+      }
+
+      if (isDark) {
+        if (runStart === -1) runStart = x
+        gapCount = 0
+      } else {
+        if (runStart !== -1) {
+          gapCount++
+          if (gapCount > MAX_GAP) {
+            var runEnd = x - gapCount
+            if (runEnd - runStart >= MIN_LINE_LENGTH) {
+              hSegments.push({ x1: runStart, y1: y, x2: runEnd, y2: y })
+            }
+            runStart = -1
+            gapCount = 0
+          }
+        }
+      }
+    }
+    if (runStart !== -1) {
+      var endX = width - 1 - gapCount
+      if (endX - runStart >= MIN_LINE_LENGTH) {
+        hSegments.push({ x1: runStart, y1: y, x2: endX, y2: y })
+      }
+    }
+  }
+
+  // Step 3: Detect vertical wall segments
+  var vSegments = []
+  for (var x2 = 1; x2 < width - 1; x2++) {
+    var runStartV = -1
+    var gapCountV = 0
+
+    for (var y2 = 0; y2 < height; y2++) {
+      var idx2 = y2 * width + x2
+      var isDark2 = mask[idx2] === 1
+
+      if (isDark2) {
+        var thick2 = 0
+        for (var dx = -2; dx <= 2; dx++) {
+          var nx = x2 + dx
+          if (nx >= 0 && nx < width && mask[y2 * width + nx] === 1) thick2++
+        }
+        isDark2 = thick2 >= MIN_THICKNESS
+      }
+
+      if (isDark2) {
+        if (runStartV === -1) runStartV = y2
+        gapCountV = 0
+      } else {
+        if (runStartV !== -1) {
+          gapCountV++
+          if (gapCountV > MAX_GAP) {
+            var runEndV = y2 - gapCountV
+            if (runEndV - runStartV >= MIN_LINE_LENGTH) {
+              vSegments.push({ x1: x2, y1: runStartV, x2: x2, y2: runEndV })
+            }
+            runStartV = -1
+            gapCountV = 0
+          }
+        }
+      }
+    }
+    if (runStartV !== -1) {
+      var endY = height - 1 - gapCountV
+      if (endY - runStartV >= MIN_LINE_LENGTH) {
+        vSegments.push({ x1: x2, y1: runStartV, x2: x2, y2: endY })
+      }
+    }
+  }
+
+  // Step 4: Merge nearby parallel segments
+  // Horizontal: merge segments at similar y with overlapping x ranges
+  var mergedH = mergeSegments(hSegments, 'h', 4)
+  var mergedV = mergeSegments(vSegments, 'v', 4)
+
+  return { horizontal: mergedH, vertical: mergedV, mask: mask }
+}
+
+function mergeSegments(segments, axis, tolerance) {
+  if (segments.length === 0) return []
+
+  // Sort by position (y for horizontal, x for vertical)
+  var sorted = segments.slice().sort(function(a, b) {
+    if (axis === 'h') return a.y1 - b.y1 || a.x1 - b.x1
+    return a.x1 - b.x1 || a.y1 - b.y1
+  })
+
+  var merged = []
+  var cur = Object.assign({}, sorted[0])
+
+  for (var i = 1; i < sorted.length; i++) {
+    var seg = sorted[i]
+    var samePos = axis === 'h'
+      ? Math.abs(seg.y1 - cur.y1) <= tolerance
+      : Math.abs(seg.x1 - cur.x1) <= tolerance
+
+    var overlaps = axis === 'h'
+      ? seg.x1 <= cur.x2 + tolerance
+      : seg.y1 <= cur.y2 + tolerance
+
+    if (samePos && overlaps) {
+      // Merge
+      if (axis === 'h') {
+        cur.x2 = Math.max(cur.x2, seg.x2)
+        cur.y1 = Math.round((cur.y1 + seg.y1) / 2)
+        cur.y2 = cur.y1
+      } else {
+        cur.y2 = Math.max(cur.y2, seg.y2)
+        cur.x1 = Math.round((cur.x1 + seg.x1) / 2)
+        cur.x2 = cur.x1
+      }
+    } else {
+      merged.push(cur)
+      cur = Object.assign({}, seg)
+    }
+  }
+  merged.push(cur)
+
+  return merged
+}
+
+
+// ─── DOOR DETECTION from the dark pixel mask ─────────────────────────────────
+// Doors are gaps in walls where there's an arc (curved line).
+// We detect them by finding gaps in wall lines and checking for curved pixels nearby.
+
+function detectDoorGaps(hWalls, vWalls, mask, width, height) {
+  var doors = []
+
+  // For each horizontal wall, check if there are gaps
+  // A gap in a horizontal wall at row y means: there's a range of x where no wall exists
+  // but walls exist on both sides
+  // We look for arcs near those gaps
+
+  // Actually, the door arcs are already detected as short curved dark pixel regions
+  // For now, we just identify wall gaps as potential door locations
+  // The actual arc drawing will come from the pixel data
+
+  return doors
+}
 
 
 // ─── COMPONENT ───────────────────────────────────────────────────────────────
+
 export default function FloorPlanAnalyzer() {
   const [image, setImage] = useState(null)
   const [imageData, setImageData] = useState(null)
@@ -83,8 +222,9 @@ export default function FloorPlanAnalyzer() {
   const [error, setError] = useState(null)
   const canvasRef = useRef(null)
   const fileRef = useRef(null)
+  const imgElRef = useRef(null)
 
-  const handleFile = useCallback(function(file) {
+  var handleFile = useCallback(function(file) {
     if (!file || !file.type || !file.type.startsWith('image/')) return
     setError(null)
     setAnalysis(null)
@@ -98,10 +238,10 @@ export default function FloorPlanAnalyzer() {
         c.width = img.width * scale
         c.height = img.height * scale
         c.getContext('2d').drawImage(img, 0, 0, c.width, c.height)
-        var dataUrl = c.toDataURL('image/jpeg', 0.85)
+        var dataUrl = c.toDataURL('image/png')
         setImage(dataUrl)
-        setImageData(dataUrl.split(',')[1])
         setImgSize({ w: c.width, h: c.height })
+        imgElRef.current = { canvas: c, width: c.width, height: c.height }
       }
       img.src = e.target.result
     }
@@ -115,52 +255,74 @@ export default function FloorPlanAnalyzer() {
   }, [handleFile])
 
   var analyze = async function() {
-    if (!imageData) return
+    if (!imgElRef.current) return
     setLoading(true)
     setError(null)
     setAnalysis(null)
 
     try {
-      var apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
-      if (!apiKey) throw new Error('Set VITE_ANTHROPIC_API_KEY in environment')
+      var imgCanvas = imgElRef.current.canvas
+      var w = imgElRef.current.width
+      var h = imgElRef.current.height
 
-      var resp = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true'
-        },
-        body: JSON.stringify({
-          model: MODEL,
-          max_tokens: 8192,
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageData } },
-              { type: 'text', text: ANALYSIS_PROMPT }
-            ]
-          }]
-        })
+      // STEP 1: Image processing — detect walls from dark pixels
+      var ctx = imgCanvas.getContext('2d')
+      var pixelData = ctx.getImageData(0, 0, w, h)
+
+      var wallData = detectWalls(pixelData, w, h)
+      var allWalls = wallData.horizontal.concat(wallData.vertical)
+
+      // STEP 2: (Optional) Call AI for text labels only
+      var labels = []
+      try {
+        var apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
+        if (apiKey) {
+          var dataUrl = imgCanvas.toDataURL('image/jpeg', 0.85)
+          var base64 = dataUrl.split(',')[1]
+
+          var resp = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': apiKey,
+              'anthropic-version': '2023-06-01',
+              'anthropic-dangerous-direct-browser-access': 'true'
+            },
+            body: JSON.stringify({
+              model: MODEL,
+              max_tokens: 2048,
+              messages: [{
+                role: 'user',
+                content: [
+                  { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
+                  { type: 'text', text: LABEL_PROMPT }
+                ]
+              }]
+            })
+          })
+
+          if (resp.ok) {
+            var data = await resp.json()
+            var text = ''
+            data.content.forEach(function(b) { text += (b.text || '') })
+            var clean = text.replace(/```json/g, '').replace(/```/g, '').trim()
+            var parsed = JSON.parse(clean)
+            labels = parsed.labels || []
+          }
+        }
+      } catch (labelErr) {
+        console.warn('Label detection failed:', labelErr)
+      }
+
+      setAnalysis({
+        walls: allWalls,
+        hWalls: wallData.horizontal.length,
+        vWalls: wallData.vertical.length,
+        labels: labels,
+        imgWidth: w,
+        imgHeight: h
       })
 
-      if (!resp.ok) {
-        var errData = await resp.json().catch(function() { return {} })
-        throw new Error((errData.error && errData.error.message) || ('API error ' + resp.status))
-      }
-
-      var data = await resp.json()
-      var text = ''
-      if (data.content) {
-        data.content.forEach(function(b) { text += (b.text || '') })
-      }
-      var clean = text.replace(/```json/g, '').replace(/```/g, '').trim()
-      var parsed = JSON.parse(clean)
-
-      if (!parsed.walls || parsed.walls.length === 0) throw new Error('No walls found')
-
-      setAnalysis(parsed)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -179,30 +341,17 @@ export default function FloorPlanAnalyzer() {
     if (!canvas || !analysis) return
 
     var walls = analysis.walls || []
-    var doors = analysis.doors || []
-    var labels = analysis.labels || []
-    var ppm = analysis.pixels_per_meter || 80
+    if (walls.length === 0) return
 
-    // Use the AI-reported image size, or fall back to our measured size
-    var aiW = analysis.image_width || (imgSize && imgSize.w) || 800
-    var aiH = analysis.image_height || (imgSize && imgSize.h) || 1000
+    var srcW = analysis.imgWidth
+    var srcH = analysis.imgHeight
 
-    // We know our actual sent image size
-    var actualW = (imgSize && imgSize.w) || aiW
-    var actualH = (imgSize && imgSize.h) || aiH
+    // Scale to fit display
+    var PAD = 60
+    var scale = Math.min((850 - PAD * 2) / srcW, (750 - PAD * 2) / srcH, 1)
 
-    // Scale factor: AI pixel coords -> our actual image coords
-    var scaleX = actualW / aiW
-    var scaleY = actualH / aiH
-
-    // Canvas padding for dimension labels
-    var PAD = 70
-
-    // Scale to fit canvas nicely (target ~800px wide)
-    var drawScale = Math.min((850 - PAD * 2) / actualW, (750 - PAD * 2) / actualH, 1)
-
-    var cw = actualW * drawScale + PAD * 2
-    var ch = actualH * drawScale + PAD * 2
+    var cw = srcW * scale + PAD * 2
+    var ch = srcH * scale + PAD * 2
 
     canvas.width = cw
     canvas.height = ch
@@ -212,14 +361,12 @@ export default function FloorPlanAnalyzer() {
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, cw, ch)
 
-    // Transform AI pixel coordinates to canvas coordinates
-    var X = function(px) { return PAD + px * scaleX * drawScale }
-    var Y = function(py) { return PAD + py * scaleY * drawScale }
-    var S = function(px) { return px * scaleX * drawScale }
+    var X = function(px) { return PAD + px * scale }
+    var Y = function(py) { return PAD + py * scale }
 
-    // ── Draw walls ─────────────────────────────────────────────────────
+    // Draw walls
     ctx.strokeStyle = '#1a1a1a'
-    ctx.lineWidth = 4
+    ctx.lineWidth = Math.max(2, 4 * scale)
     ctx.lineCap = 'square'
 
     walls.forEach(function(w) {
@@ -229,93 +376,9 @@ export default function FloorPlanAnalyzer() {
       ctx.stroke()
     })
 
-    // ── Draw doors ─────────────────────────────────────────────────────
-    ctx.strokeStyle = '#4B5563'
-    ctx.lineWidth = 1.5
-    ctx.lineCap = 'round'
-
-    doors.forEach(function(d) {
-      var cx = X(d.cx)
-      var cy = Y(d.cy)
-      var r = S(d.radius)
-      var sa = (d.start_deg || 0) * Math.PI / 180
-      var ea = (d.end_deg || 90) * Math.PI / 180
-
-      // Draw arc
-      ctx.beginPath()
-      ctx.arc(cx, cy, r, sa, ea, false)
-      ctx.stroke()
-
-      // Draw door panel line
-      var la = (d.line_to_deg != null ? d.line_to_deg : d.end_deg) * Math.PI / 180
-      ctx.beginPath()
-      ctx.moveTo(cx, cy)
-      ctx.lineTo(cx + r * Math.cos(la), cy + r * Math.sin(la))
-      ctx.stroke()
-    })
-
-    // ── Draw labels ────────────────────────────────────────────────────
-    labels.forEach(function(lb) {
-      var lx = X(lb.cx)
-      var ly = Y(lb.cy)
-
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
-      ctx.fillStyle = '#1f2937'
-      ctx.font = '600 12px "Segoe UI", system-ui, sans-serif'
-      ctx.fillText(lb.text, lx, ly)
-    })
-
-    // ── Dimension labels using pixels_per_meter ────────────────────────
-    // Find bounding box of all walls
-    var minPx = Infinity, minPy = Infinity, maxPx = -Infinity, maxPy = -Infinity
-    walls.forEach(function(w) {
-      minPx = Math.min(minPx, w.x1, w.x2)
-      minPy = Math.min(minPy, w.y1, w.y2)
-      maxPx = Math.max(maxPx, w.x1, w.x2)
-      maxPy = Math.max(maxPy, w.y1, w.y2)
-    })
-
-    var totalWidthM = (maxPx - minPx) / ppm
-    var totalHeightM = (maxPy - minPy) / ppm
-
-    var TICK = 6, OFFSET = 25
-    ctx.strokeStyle = '#6b7280'
-    ctx.fillStyle = '#4b5563'
-    ctx.lineWidth = 0.8
-    ctx.font = '11px "Segoe UI", system-ui, sans-serif'
-
-    // Top dimension
-    var tx1 = X(minPx), tx2 = X(maxPx), ty = Y(minPy)
-    var tly = ty - OFFSET
-    ctx.beginPath()
-    ctx.moveTo(tx1, ty); ctx.lineTo(tx1, tly)
-    ctx.moveTo(tx2, ty); ctx.lineTo(tx2, tly)
-    ctx.moveTo(tx1, tly); ctx.lineTo(tx2, tly)
-    ctx.moveTo(tx1, tly - TICK); ctx.lineTo(tx1, tly + TICK)
-    ctx.moveTo(tx2, tly - TICK); ctx.lineTo(tx2, tly + TICK)
-    ctx.stroke()
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'bottom'
-    ctx.fillText(totalWidthM.toFixed(2) + 'm', (tx1 + tx2) / 2, tly - 3)
-
-    // Left dimension
-    var ly1 = Y(minPy), ly2 = Y(maxPy), lx = X(minPx)
-    var llx = lx - OFFSET
-    ctx.beginPath()
-    ctx.moveTo(lx, ly1); ctx.lineTo(llx, ly1)
-    ctx.moveTo(lx, ly2); ctx.lineTo(llx, ly2)
-    ctx.moveTo(llx, ly1); ctx.lineTo(llx, ly2)
-    ctx.moveTo(llx - TICK, ly1); ctx.lineTo(llx + TICK, ly1)
-    ctx.moveTo(llx - TICK, ly2); ctx.lineTo(llx + TICK, ly2)
-    ctx.stroke()
-    ctx.save()
-    ctx.translate(llx - 4, (ly1 + ly2) / 2)
-    ctx.rotate(-Math.PI / 2)
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'bottom'
-    ctx.fillText(totalHeightM.toFixed(2) + 'm', 0, 0)
-    ctx.restore()
+    // Draw labels from AI (positioned roughly in room centers)
+    // Since AI doesn't know pixel positions, we skip label placement for now
+    // The wall structure itself tells the story
 
     // North arrow
     ctx.fillStyle = '#9ca3af'
@@ -323,8 +386,14 @@ export default function FloorPlanAnalyzer() {
     ctx.textAlign = 'right'
     ctx.textBaseline = 'top'
     ctx.fillText('N \u2191', cw - 8, 8)
-  }
 
+    // Stats
+    ctx.fillStyle = '#6b7280'
+    ctx.font = '10px sans-serif'
+    ctx.textAlign = 'left'
+    ctx.textBaseline = 'bottom'
+    ctx.fillText(analysis.hWalls + ' horizontal + ' + analysis.vWalls + ' vertical walls detected', PAD, ch - 8)
+  }
 
   return (
     <div className="fpa-root">
@@ -351,9 +420,9 @@ export default function FloorPlanAnalyzer() {
           <img src={image} alt="Floor plan" className="fpa-preview" />
           <div className="fpa-buttons">
             <button onClick={analyze} disabled={loading} className="fpa-btn fpa-btn-primary">
-              {loading ? 'Analyzing\u2026' : 'Analyze Floor Plan'}
+              {loading ? 'Processing\u2026' : 'Detect Walls'}
             </button>
-            <button onClick={function() { setImage(null); setImageData(null); setAnalysis(null); setError(null) }}
+            <button onClick={function() { setImage(null); setImageData(null); setImgSize(null); setAnalysis(null); setError(null); imgElRef.current = null }}
               className="fpa-btn fpa-btn-secondary">Clear</button>
           </div>
         </div>
@@ -364,24 +433,24 @@ export default function FloorPlanAnalyzer() {
       {loading && (
         <div className="fpa-loading">
           <div className="fpa-spinner" />
-          <p>Analyzing floor plan with AI&hellip;</p>
-          <p className="fpa-loading-sub">Tracing every wall line and door arc</p>
+          <p>Processing floor plan&hellip;</p>
+          <p className="fpa-loading-sub">Scanning pixels for wall lines</p>
         </div>
       )}
 
       {analysis && (
         <div className="fpa-result">
           <div className="fpa-result-header">
-            <h2>Floor Plan Drawing</h2>
+            <h2>Detected Floor Plan</h2>
             <div className="fpa-result-stats">
-              {(analysis.walls && analysis.walls.length) || 0} wall segments &middot; {(analysis.doors && analysis.doors.length) || 0} doors &middot; {(analysis.labels && analysis.labels.length) || 0} labels
+              {analysis.hWalls} horizontal walls &middot; {analysis.vWalls} vertical walls
             </div>
           </div>
           <div className="fpa-canvas-wrap">
             <canvas ref={canvasRef} className="fpa-canvas" />
           </div>
           <details className="fpa-details">
-            <summary>Raw AI Response</summary>
+            <summary>Detection Data ({analysis.walls.length} segments)</summary>
             <pre className="fpa-json">{JSON.stringify(analysis, null, 2)}</pre>
           </details>
         </div>
