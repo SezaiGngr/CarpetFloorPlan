@@ -6,9 +6,9 @@ const MAX_IMG_WIDTH = 900
 
 const LABEL_PROMPT = `Look at this floor plan image carefully.
 
-1. Find ALL dimension annotations written on or near the plan edges that show the TOTAL width or TOTAL height of the entire floor plan. These are usually the largest numbers, placed along the very top/bottom edge or left/right edge with dimension lines spanning the full width or height.
+Find the TOTAL overall width and height of the ENTIRE floor plan building outline. These are dimension lines that span the full width or full height of the building.
 
-2. List room dimension labels like "3.7 x 3.7M".
+Also list all room dimension labels.
 
 Return JSON:
 {
@@ -20,9 +20,9 @@ Return JSON:
   ]
 }
 
-- "overall_width_m": The TOTAL width of the entire plan in meters. Look for the longest horizontal dimension line at the top or bottom edge.
-- "overall_height_m": The TOTAL height of the entire plan in meters. Look for the longest vertical dimension line on the left or right edge.
-- If you cannot find an overall dimension, set it to null.
+- If multiple width dimensions exist at top, ADD them together if they cover different sections of the same edge.
+- If no single overall dimension exists, ADD the individual segments. For example if the top edge shows "3.7" and "5.5", overall_width = 3.7 + 5.5 = 9.2
+- Same for height on left/right edges.
 
 Return ONLY valid JSON.`
 
@@ -31,10 +31,10 @@ Return ONLY valid JSON.`
 
 function detectWalls(imageData, width, height) {
   var data = imageData.data
-  var DARK = 100
+  var DARK = 105
   var MIN_LEN = 15
   var MIN_THICK = 3
-  var MAX_GAP = 5
+  var MAX_GAP = 6
 
   var mask = new Uint8Array(width * height)
   for (var i = 0; i < width * height; i++) {
@@ -42,12 +42,16 @@ function detectWalls(imageData, width, height) {
     if (a > 100 && r < DARK && g < DARK && b < DARK) mask[i] = 1
   }
 
-  // Horizontal segments
+  // ── Measure wall thickness at each dark pixel ──────────────────────
+  // Real walls are 4-10px thick. Dimension lines/text are 1-2px.
+  // We build a thickness map to distinguish them.
+
+  // Horizontal scan
   var hSegs = []
   var lastHY = -999
 
   for (var y = 0; y < height; y++) {
-    if (y - lastHY < 8) continue
+    if (y - lastHY < 7) continue
 
     var runStart = -1, gap = 0, foundAny = false
     for (var x = 0; x < width; x++) {
@@ -81,12 +85,12 @@ function detectWalls(imageData, width, height) {
     if (foundAny) lastHY = y
   }
 
-  // Vertical segments
+  // Vertical scan
   var vSegs = []
   var lastVX = -999
 
   for (var x2 = 0; x2 < width; x2++) {
-    if (x2 - lastVX < 8) continue
+    if (x2 - lastVX < 7) continue
 
     var runStart2 = -1, gap2 = 0, foundAny2 = false
     for (var y2 = 0; y2 < height; y2++) {
@@ -123,43 +127,79 @@ function detectWalls(imageData, width, height) {
   var mergedH = mergeSegments(hSegs, 'h', 10)
   var mergedV = mergeSegments(vSegs, 'v', 10)
 
-  // Filter ONLY truly isolated short segments (not connected AND short)
-  mergedH = filterFloating(mergedH, mergedV, 'h', 25)
-  mergedV = filterFloating(mergedV, mergedH, 'v', 25)
+  // ── Find the building envelope and remove outside segments ─────────
+  var envelope = findBuildingEnvelope(mergedH, mergedV)
+  if (envelope) {
+    mergedH = filterOutsideEnvelope(mergedH, envelope, 'h', 15)
+    mergedV = filterOutsideEnvelope(mergedV, envelope, 'v', 15)
+  }
+
+  // Filter truly floating short segments
+  mergedH = filterFloating(mergedH, mergedV, 'h', 30)
+  mergedV = filterFloating(mergedV, mergedH, 'v', 30)
 
   return { horizontal: mergedH, vertical: mergedV }
 }
 
-// Only remove segments that are BOTH short AND not connected to any perpendicular wall
+
+// Find the main building rectangle (the outermost continuous walls)
+function findBuildingEnvelope(hWalls, vWalls) {
+  if (hWalls.length < 2 || vWalls.length < 2) return null
+
+  // The building envelope is defined by the longest walls near the edges
+  // Sort H walls by y, find top and bottom exterior walls
+  var hSorted = hWalls.slice().sort(function(a, b) { return a.y1 - b.y1 })
+  var vSorted = vWalls.slice().sort(function(a, b) { return a.x1 - b.x1 })
+
+  // Find the longest H walls near top and bottom
+  var topWalls = hSorted.filter(function(w) { return w.y1 < hSorted[0].y1 + 30 })
+  var bottomWalls = hSorted.filter(function(w) { return w.y1 > hSorted[hSorted.length - 1].y1 - 30 })
+
+  var leftWalls = vSorted.filter(function(w) { return w.x1 < vSorted[0].x1 + 30 })
+  var rightWalls = vSorted.filter(function(w) { return w.x1 > vSorted[vSorted.length - 1].x1 - 30 })
+
+  // Pick the longest wall in each group as the boundary
+  var topY = topWalls.length > 0 ? topWalls[0].y1 : 0
+  var bottomY = bottomWalls.length > 0 ? bottomWalls[bottomWalls.length - 1].y1 : 9999
+  var leftX = leftWalls.length > 0 ? leftWalls[0].x1 : 0
+  var rightX = rightWalls.length > 0 ? rightWalls[rightWalls.length - 1].x1 : 9999
+
+  return { top: topY, bottom: bottomY, left: leftX, right: rightX }
+}
+
+
+// Remove segments that are outside the building envelope (dimension annotation lines)
+function filterOutsideEnvelope(walls, env, axis, margin) {
+  return walls.filter(function(w) {
+    if (axis === 'h') {
+      // Horizontal wall: its y must be within envelope top-bottom range
+      return w.y1 >= env.top - margin && w.y1 <= env.bottom + margin
+    } else {
+      // Vertical wall: its x must be within envelope left-right range
+      return w.x1 >= env.left - margin && w.x1 <= env.right + margin
+    }
+  })
+}
+
+
 function filterFloating(walls, crossWalls, axis, connectTol) {
   return walls.filter(function(w) {
-    // Calculate length
     var len = axis === 'h' ? (w.x2 - w.x1) : (w.y2 - w.y1)
+    if (len > 50) return true
 
-    // Long walls are always kept
-    if (len > 60) return true
-
-    // Short walls: check if connected to anything
     var connected = false
     crossWalls.forEach(function(cw) {
       if (connected) return
       if (axis === 'h') {
-        var vy1 = cw.y1, vy2 = cw.y2, vx = cw.x1
-        if (w.y1 >= vy1 - connectTol && w.y1 <= vy2 + connectTol) {
-          if (Math.abs(vx - w.x1) < connectTol || Math.abs(vx - w.x2) < connectTol) {
-            connected = true
-          }
+        if (w.y1 >= cw.y1 - connectTol && w.y1 <= cw.y2 + connectTol) {
+          if (Math.abs(cw.x1 - w.x1) < connectTol || Math.abs(cw.x1 - w.x2) < connectTol) connected = true
         }
       } else {
-        var hx1 = cw.x1, hx2 = cw.x2, hy = cw.y1
-        if (w.x1 >= hx1 - connectTol && w.x1 <= hx2 + connectTol) {
-          if (Math.abs(hy - w.y1) < connectTol || Math.abs(hy - w.y2) < connectTol) {
-            connected = true
-          }
+        if (w.x1 >= cw.x1 - connectTol && w.x1 <= cw.x2 + connectTol) {
+          if (Math.abs(cw.y1 - w.y1) < connectTol || Math.abs(cw.y1 - w.y2) < connectTol) connected = true
         }
       }
     })
-
     return connected
   })
 }
@@ -213,36 +253,25 @@ function calculatePPM(wallData, aiData, imgW, imgH) {
   var allWalls = wallData.horizontal.concat(wallData.vertical)
   if (allWalls.length === 0) return 80
 
-  // Find bounding box of all walls
   var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
   allWalls.forEach(function(w) {
     minX = Math.min(minX, w.x1, w.x2); maxX = Math.max(maxX, w.x1, w.x2)
     minY = Math.min(minY, w.y1, w.y2); maxY = Math.max(maxY, w.y1, w.y2)
   })
 
-  var planWidthPx = maxX - minX
-  var planHeightPx = maxY - minY
+  var planWPx = maxX - minX
+  var planHPx = maxY - minY
 
-  if (!aiData) return planWidthPx / 10  // fallback
+  if (!aiData) return planWPx / 10
 
-  // Method 1 (best): Use overall plan dimensions
-  var ppmFromWidth = null, ppmFromHeight = null
+  var ppmW = null, ppmH = null
+  if (aiData.overall_width_m && aiData.overall_width_m > 0) ppmW = planWPx / aiData.overall_width_m
+  if (aiData.overall_height_m && aiData.overall_height_m > 0) ppmH = planHPx / aiData.overall_height_m
 
-  if (aiData.overall_width_m && aiData.overall_width_m > 0) {
-    ppmFromWidth = planWidthPx / aiData.overall_width_m
-  }
-  if (aiData.overall_height_m && aiData.overall_height_m > 0) {
-    ppmFromHeight = planHeightPx / aiData.overall_height_m
-  }
-
-  if (ppmFromWidth && ppmFromHeight) {
-    return (ppmFromWidth + ppmFromHeight) / 2
-  }
-  if (ppmFromWidth) return ppmFromWidth
-  if (ppmFromHeight) return ppmFromHeight
-
-  // Method 2: fallback
-  return planWidthPx / 10
+  if (ppmW && ppmH) return (ppmW + ppmH) / 2
+  if (ppmW) return ppmW
+  if (ppmH) return ppmH
+  return planWPx / 10
 }
 
 
@@ -261,7 +290,6 @@ export default function FloorPlanAnalyzer() {
   var handleFile = useCallback(function(file) {
     if (!file || !file.type || !file.type.startsWith('image/')) return
     setError(null); setAnalysis(null)
-
     var reader = new FileReader()
     reader.onload = function(e) {
       var img = new Image()
@@ -293,17 +321,14 @@ export default function FloorPlanAnalyzer() {
       var imgCanvas = imgElRef.current.canvas
       var w = imgElRef.current.width, h = imgElRef.current.height
 
-      var ctx = imgCanvas.getContext('2d')
-      var pixelData = ctx.getImageData(0, 0, w, h)
+      var pixelData = imgCanvas.getContext('2d').getImageData(0, 0, w, h)
       var wallData = detectWalls(pixelData, w, h)
 
-      // AI for labels + overall dimensions
       var aiData = null, labels = [], ppm = null
       try {
         var apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
         if (apiKey) {
-          var dataUrl = imgCanvas.toDataURL('image/jpeg', 0.85)
-          var base64 = dataUrl.split(',')[1]
+          var base64 = imgCanvas.toDataURL('image/jpeg', 0.85).split(',')[1]
           var resp = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -326,8 +351,7 @@ export default function FloorPlanAnalyzer() {
           if (resp.ok) {
             var data = await resp.json()
             var text = ''; data.content.forEach(function(b) { text += (b.text || '') })
-            var clean = text.replace(/```json/g, '').replace(/```/g, '').trim()
-            aiData = JSON.parse(clean)
+            aiData = JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim())
             labels = aiData.labels || []
           }
         }
@@ -337,20 +361,13 @@ export default function FloorPlanAnalyzer() {
 
       setAnalysis({
         walls: wallData.horizontal.concat(wallData.vertical),
-        hWalls: wallData.horizontal,
-        vWalls: wallData.vertical,
-        hCount: wallData.horizontal.length,
-        vCount: wallData.vertical.length,
-        labels: labels,
-        ppm: ppm,
-        aiData: aiData,
+        hWalls: wallData.horizontal, vWalls: wallData.vertical,
+        hCount: wallData.horizontal.length, vCount: wallData.vertical.length,
+        labels: labels, ppm: ppm, aiData: aiData,
         imgWidth: w, imgHeight: h
       })
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
+    } catch (err) { setError(err.message) }
+    finally { setLoading(false) }
   }
 
   useEffect(function() {
@@ -361,9 +378,7 @@ export default function FloorPlanAnalyzer() {
     var canvas = canvasRef.current
     if (!canvas || !analysis) return
 
-    var hWalls = analysis.hWalls || []
-    var vWalls = analysis.vWalls || []
-    var allWalls = hWalls.concat(vWalls)
+    var allWalls = (analysis.hWalls || []).concat(analysis.vWalls || [])
     if (allWalls.length === 0) return
 
     var srcW = analysis.imgWidth, srcH = analysis.imgHeight
@@ -371,8 +386,7 @@ export default function FloorPlanAnalyzer() {
 
     var PAD = 70
     var scale = Math.min((900 - PAD * 2) / srcW, (800 - PAD * 2) / srcH, 1)
-    var cw = srcW * scale + PAD * 2
-    var ch = srcH * scale + PAD * 2
+    var cw = srcW * scale + PAD * 2, ch = srcH * scale + PAD * 2
     canvas.width = cw; canvas.height = ch
 
     var ctx = canvas.getContext('2d')
@@ -383,59 +397,42 @@ export default function FloorPlanAnalyzer() {
     var X = function(px) { return PAD + px * scale }
     var Y = function(py) { return PAD + py * scale }
 
-    // Draw walls
+    // Walls
     ctx.strokeStyle = '#1a1a1a'
     ctx.lineWidth = Math.max(2.5, 4 * scale)
     ctx.lineCap = 'square'
-
     allWalls.forEach(function(w) {
-      ctx.beginPath()
-      ctx.moveTo(X(w.x1), Y(w.y1))
-      ctx.lineTo(X(w.x2), Y(w.y2))
-      ctx.stroke()
+      ctx.beginPath(); ctx.moveTo(X(w.x1), Y(w.y1)); ctx.lineTo(X(w.x2), Y(w.y2)); ctx.stroke()
     })
 
-    // Dimension labels
-    var MIN_LABEL_PX = 35
+    // Dimensions
     ctx.fillStyle = '#2563eb'
-
     allWalls.forEach(function(w) {
       var dx = w.x2 - w.x1, dy = w.y2 - w.y1
       var lenPx = Math.sqrt(dx * dx + dy * dy)
-      var lenM = lenPx / ppm
       var screenLen = lenPx * scale
-      if (screenLen < MIN_LABEL_PX) return
+      if (screenLen < 35) return
 
+      var lenM = lenPx / ppm
       var label = lenM.toFixed(2) + 'm'
-      var fontSize = Math.max(8, Math.min(11, screenLen / 8))
-      ctx.font = fontSize + 'px "Segoe UI", system-ui, sans-serif'
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
+      var fs = Math.max(8, Math.min(11, screenLen / 8))
+      ctx.font = fs + 'px "Segoe UI", system-ui, sans-serif'
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
 
-      var mx = X((w.x1 + w.x2) / 2)
-      var my = Y((w.y1 + w.y2) / 2)
-
+      var mx = X((w.x1 + w.x2) / 2), my = Y((w.y1 + w.y2) / 2)
       if (Math.abs(dy) < 2) {
         ctx.fillText(label, mx, my - 10)
       } else {
-        ctx.save()
-        ctx.translate(mx - 10, my)
-        ctx.rotate(-Math.PI / 2)
-        ctx.fillText(label, 0, 0)
-        ctx.restore()
+        ctx.save(); ctx.translate(mx - 10, my); ctx.rotate(-Math.PI / 2)
+        ctx.fillText(label, 0, 0); ctx.restore()
       }
     })
 
-    ctx.fillStyle = '#9ca3af'
-    ctx.font = '11px sans-serif'
-    ctx.textAlign = 'right'
-    ctx.textBaseline = 'top'
+    ctx.fillStyle = '#9ca3af'; ctx.font = '11px sans-serif'
+    ctx.textAlign = 'right'; ctx.textBaseline = 'top'
     ctx.fillText('N \u2191', cw - 8, 8)
-
-    ctx.fillStyle = '#6b7280'
-    ctx.font = '10px sans-serif'
-    ctx.textAlign = 'left'
-    ctx.textBaseline = 'bottom'
+    ctx.fillStyle = '#6b7280'; ctx.font = '10px sans-serif'
+    ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
     ctx.fillText(analysis.hCount + 'H + ' + analysis.vCount + 'V | ppm=' + (ppm || 0).toFixed(1), PAD, ch - 8)
   }
 
@@ -445,7 +442,6 @@ export default function FloorPlanAnalyzer() {
         <h1>CarpetPlan</h1>
         <p className="fpa-subtitle">Upload a floor plan &rarr; Detect walls &amp; measure dimensions</p>
       </header>
-
       {!image && (
         <div className="fpa-upload"
           onClick={function() { fileRef.current && fileRef.current.click() }}
@@ -458,22 +454,18 @@ export default function FloorPlanAnalyzer() {
           <span className="fpa-upload-text">Drop floor plan image or click to browse</span>
         </div>
       )}
-
       {image && (
         <div className="fpa-controls">
           <img src={image} alt="Floor plan" className="fpa-preview" />
           <div className="fpa-buttons">
             <button onClick={analyze} disabled={loading} className="fpa-btn fpa-btn-primary">
-              {loading ? 'Processing\u2026' : 'Detect Walls'}
-            </button>
+              {loading ? 'Processing\u2026' : 'Detect Walls'}</button>
             <button onClick={function() { setImage(null); setImgSize(null); setAnalysis(null); setError(null); imgElRef.current = null }}
               className="fpa-btn fpa-btn-secondary">Clear</button>
           </div>
         </div>
       )}
-
       {error && <div className="fpa-error">{error}</div>}
-
       {loading && (
         <div className="fpa-loading">
           <div className="fpa-spinner" />
@@ -481,7 +473,6 @@ export default function FloorPlanAnalyzer() {
           <p className="fpa-loading-sub">Scanning pixels, calibrating dimensions</p>
         </div>
       )}
-
       {analysis && (
         <div className="fpa-result">
           <div className="fpa-result-header">
@@ -497,9 +488,7 @@ export default function FloorPlanAnalyzer() {
           <details className="fpa-details">
             <summary>Detection Data</summary>
             <pre className="fpa-json">{JSON.stringify({
-              aiData: analysis.aiData,
-              ppm: analysis.ppm,
-              wallCount: analysis.walls.length
+              aiData: analysis.aiData, ppm: analysis.ppm, wallCount: analysis.walls.length
             }, null, 2)}</pre>
           </details>
         </div>
