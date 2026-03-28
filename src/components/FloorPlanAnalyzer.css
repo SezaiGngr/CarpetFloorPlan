@@ -1,467 +1,254 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
-import './FloorPlanAnalyzer.css'
+/* CarpetPlan — FloorPlanAnalyzer Styles */
 
-const MODEL = 'claude-sonnet-4-20250514'
-const MAX_IMG_WIDTH = 900
-
-const LABEL_PROMPT = `Look at this floor plan image carefully.
-
-1. Find ALL dimension annotations written on or near the plan edges that show the TOTAL width or TOTAL height of the entire floor plan. These are usually the largest numbers, placed along the very top/bottom edge or left/right edge with dimension lines spanning the full width or height.
-
-2. List room dimension labels like "3.7 x 3.7M".
-
-Return JSON:
-{
-  "overall_width_m": 9.2,
-  "overall_height_m": 12.9,
-  "labels": [
-    { "text": "3.7 x 3.7M", "type": "dimension" },
-    { "text": "BATH", "type": "room_name" }
-  ]
+.fpa-root {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  color: #1f2937;
 }
 
-- "overall_width_m": The TOTAL width of the entire plan in meters. Look for the longest horizontal dimension line at the top or bottom edge.
-- "overall_height_m": The TOTAL height of the entire plan in meters. Look for the longest vertical dimension line on the left or right edge.
-- If you cannot find an overall dimension, set it to null.
-
-Return ONLY valid JSON.`
-
-
-// ─── IMAGE PROCESSING ────────────────────────────────────────────────────────
-
-function detectWalls(imageData, width, height) {
-  var data = imageData.data
-  var DARK = 105
-  var MIN_LEN = 15
-  var MIN_THICK = 3
-  var MAX_GAP = 6
-
-  var mask = new Uint8Array(width * height)
-  for (var i = 0; i < width * height; i++) {
-    var r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2], a = data[i * 4 + 3]
-    if (a > 100 && r < DARK && g < DARK && b < DARK) mask[i] = 1
-  }
-
-  // ── Horizontal scan ──────────────────────────────────────────────────
-  var hSegs = []
-  var lastHY = -999
-
-  for (var y = 0; y < height; y++) {
-    if (y - lastHY < 7) continue
-
-    var runStart = -1, gap = 0, foundAny = false
-    for (var x = 0; x < width; x++) {
-      var thick = 0
-      for (var dy = -4; dy <= 4; dy++) {
-        var ny = y + dy
-        if (ny >= 0 && ny < height && mask[ny * width + x]) thick++
-      }
-      if (thick >= MIN_THICK) {
-        if (runStart === -1) runStart = x
-        gap = 0
-      } else if (runStart !== -1) {
-        gap++
-        if (gap > MAX_GAP) {
-          var end = x - gap
-          if (end - runStart >= MIN_LEN) {
-            hSegs.push({ x1: runStart, y1: y, x2: end, y2: y })
-            foundAny = true
-          }
-          runStart = -1; gap = 0
-        }
-      }
-    }
-    if (runStart !== -1) {
-      var endX = width - 1 - gap
-      if (endX < width - 1) endX = Math.min(endX + 1, width - 1)
-      if (endX - runStart >= MIN_LEN) {
-        hSegs.push({ x1: runStart, y1: y, x2: endX, y2: y })
-        foundAny = true
-      }
-    }
-    if (foundAny) lastHY = y
-  }
-
-  // ── Vertical scan ────────────────────────────────────────────────────
-  var vSegs = []
-  var lastVX = -999
-
-  for (var x2 = 0; x2 < width; x2++) {
-    if (x2 - lastVX < 7) continue
-
-    var runStart2 = -1, gap2 = 0, foundAny2 = false
-    for (var y2 = 0; y2 < height; y2++) {
-      var thick2 = 0
-      for (var dx = -4; dx <= 4; dx++) {
-        var nx = x2 + dx
-        if (nx >= 0 && nx < width && mask[y2 * width + nx]) thick2++
-      }
-      if (thick2 >= MIN_THICK) {
-        if (runStart2 === -1) runStart2 = y2
-        gap2 = 0
-      } else if (runStart2 !== -1) {
-        gap2++
-        if (gap2 > MAX_GAP) {
-          var end2 = y2 - gap2
-          if (end2 - runStart2 >= MIN_LEN) {
-            vSegs.push({ x1: x2, y1: runStart2, x2: x2, y2: end2 })
-            foundAny2 = true
-          }
-          runStart2 = -1; gap2 = 0
-        }
-      }
-    }
-    if (runStart2 !== -1) {
-      var endY = height - 1 - gap2
-      if (endY < height - 1) endY = Math.min(endY + 1, height - 1)
-      if (endY - runStart2 >= MIN_LEN) {
-        vSegs.push({ x1: x2, y1: runStart2, x2: x2, y2: endY })
-        foundAny2 = true
-      }
-    }
-    if (foundAny2) lastVX = x2
-  }
-
-  var mergedH = mergeSegments(hSegs, 'h', 10)
-  var mergedV = mergeSegments(vSegs, 'v', 10)
-
-  // Only filter truly floating SHORT segments that connect to nothing
-  mergedH = filterFloating(mergedH, mergedV, 'h', 30)
-  mergedV = filterFloating(mergedV, mergedH, 'v', 30)
-
-  return { horizontal: mergedH, vertical: mergedV }
+.fpa-header {
+  margin-bottom: 2rem;
 }
 
-// Only remove segments that are short AND connect to no perpendicular wall
-function filterFloating(walls, crossWalls, axis, connectTol) {
-  return walls.filter(function(w) {
-    var len = axis === 'h' ? (w.x2 - w.x1) : (w.y2 - w.y1)
-    // Always keep walls longer than 50px
-    if (len > 50) return true
-
-    // For short walls, check connection
-    var connected = false
-    crossWalls.forEach(function(cw) {
-      if (connected) return
-      if (axis === 'h') {
-        var vy1 = cw.y1, vy2 = cw.y2, vx = cw.x1
-        if (w.y1 >= vy1 - connectTol && w.y1 <= vy2 + connectTol) {
-          if (Math.abs(vx - w.x1) < connectTol || Math.abs(vx - w.x2) < connectTol) connected = true
-        }
-      } else {
-        var hx1 = cw.x1, hx2 = cw.x2, hy = cw.y1
-        if (w.x1 >= hx1 - connectTol && w.x1 <= hx2 + connectTol) {
-          if (Math.abs(hy - w.y1) < connectTol || Math.abs(hy - w.y2) < connectTol) connected = true
-        }
-      }
-    })
-    return connected
-  })
+.fpa-header h1 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0 0 0.25rem;
 }
 
-
-function mergeSegments(segments, axis, tol) {
-  if (segments.length === 0) return []
-
-  var sorted = segments.slice().sort(function(a, b) {
-    if (axis === 'h') return a.y1 - b.y1 || a.x1 - b.x1
-    return a.x1 - b.x1 || a.y1 - b.y1
-  })
-
-  var merged = []
-  var cur = { x1: sorted[0].x1, y1: sorted[0].y1, x2: sorted[0].x2, y2: sorted[0].y2 }
-
-  for (var i = 1; i < sorted.length; i++) {
-    var s = sorted[i]
-    var samePos = axis === 'h'
-      ? Math.abs(s.y1 - cur.y1) <= tol
-      : Math.abs(s.x1 - cur.x1) <= tol
-    var overlaps = axis === 'h'
-      ? s.x1 <= cur.x2 + tol * 2
-      : s.y1 <= cur.y2 + tol * 2
-
-    if (samePos && overlaps) {
-      if (axis === 'h') {
-        cur.x1 = Math.min(cur.x1, s.x1)
-        cur.x2 = Math.max(cur.x2, s.x2)
-        cur.y1 = Math.round((cur.y1 + s.y1) / 2)
-        cur.y2 = cur.y1
-      } else {
-        cur.y1 = Math.min(cur.y1, s.y1)
-        cur.y2 = Math.max(cur.y2, s.y2)
-        cur.x1 = Math.round((cur.x1 + s.x1) / 2)
-        cur.x2 = cur.x1
-      }
-    } else {
-      merged.push(cur)
-      cur = { x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2 }
-    }
-  }
-  merged.push(cur)
-  return merged
+.fpa-subtitle {
+  color: #6b7280;
+  font-size: 0.95rem;
+  margin: 0;
 }
 
-
-// ─── PPM CALIBRATION ─────────────────────────────────────────────────────────
-
-function calculatePPM(wallData, aiData, imgW, imgH) {
-  var allWalls = wallData.horizontal.concat(wallData.vertical)
-  if (allWalls.length === 0) return 80
-
-  var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
-  allWalls.forEach(function(w) {
-    minX = Math.min(minX, w.x1, w.x2); maxX = Math.max(maxX, w.x1, w.x2)
-    minY = Math.min(minY, w.y1, w.y2); maxY = Math.max(maxY, w.y1, w.y2)
-  })
-
-  var planWPx = maxX - minX
-  var planHPx = maxY - minY
-
-  if (!aiData) return planWPx / 10
-
-  var ppmW = null, ppmH = null
-  if (aiData.overall_width_m && aiData.overall_width_m > 0) ppmW = planWPx / aiData.overall_width_m
-  if (aiData.overall_height_m && aiData.overall_height_m > 0) ppmH = planHPx / aiData.overall_height_m
-
-  if (ppmW && ppmH) return (ppmW + ppmH) / 2
-  if (ppmW) return ppmW
-  if (ppmH) return ppmH
-  return planWPx / 10
+/* Upload */
+.fpa-upload {
+  border: 2px dashed #d1d5db;
+  border-radius: 12px;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  background: #f9fafb;
 }
 
+.fpa-upload:hover {
+  border-color: #9ca3af;
+  background: #f3f4f6;
+}
 
-// ─── COMPONENT ───────────────────────────────────────────────────────────────
+.fpa-upload.drag {
+  border-color: #3b82f6;
+  background: #eff6ff;
+}
 
-export default function FloorPlanAnalyzer() {
-  const [image, setImage] = useState(null)
-  const [imgSize, setImgSize] = useState(null)
-  const [analysis, setAnalysis] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(null)
-  const canvasRef = useRef(null)
-  const fileRef = useRef(null)
-  const imgElRef = useRef(null)
+.fpa-upload input { display: none; }
 
-  var handleFile = useCallback(function(file) {
-    if (!file || !file.type || !file.type.startsWith('image/')) return
-    setError(null); setAnalysis(null)
-    var reader = new FileReader()
-    reader.onload = function(e) {
-      var img = new Image()
-      img.onload = function() {
-        var scale = img.width > MAX_IMG_WIDTH ? MAX_IMG_WIDTH / img.width : 1
-        var c = document.createElement('canvas')
-        c.width = img.width * scale
-        c.height = img.height * scale
-        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height)
-        setImage(c.toDataURL('image/png'))
-        setImgSize({ w: c.width, h: c.height })
-        imgElRef.current = { canvas: c, width: c.width, height: c.height }
-      }
-      img.src = e.target.result
-    }
-    reader.readAsDataURL(file)
-  }, [])
+.fpa-upload-icon {
+  display: block;
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
+}
 
-  var onDrop = useCallback(function(e) {
-    e.preventDefault(); e.currentTarget.classList.remove('drag')
-    handleFile(e.dataTransfer.files[0])
-  }, [handleFile])
+.fpa-upload-text {
+  color: #6b7280;
+  font-size: 0.95rem;
+}
 
-  var analyze = async function() {
-    if (!imgElRef.current) return
-    setLoading(true); setError(null); setAnalysis(null)
+/* Controls */
+.fpa-controls {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+  margin-bottom: 1.5rem;
+}
 
-    try {
-      var imgCanvas = imgElRef.current.canvas
-      var w = imgElRef.current.width, h = imgElRef.current.height
+.fpa-preview {
+  max-width: 280px;
+  max-height: 220px;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+  object-fit: contain;
+}
 
-      var pixelData = imgCanvas.getContext('2d').getImageData(0, 0, w, h)
-      var wallData = detectWalls(pixelData, w, h)
+.fpa-buttons {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
 
-      var aiData = null, labels = [], ppm = null
-      try {
-        var apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
-        if (apiKey) {
-          var base64 = imgCanvas.toDataURL('image/jpeg', 0.85).split(',')[1]
-          var resp = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-api-key': apiKey,
-              'anthropic-version': '2023-06-01',
-              'anthropic-dangerous-direct-browser-access': 'true'
-            },
-            body: JSON.stringify({
-              model: MODEL, max_tokens: 2048,
-              messages: [{
-                role: 'user',
-                content: [
-                  { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: base64 } },
-                  { type: 'text', text: LABEL_PROMPT }
-                ]
-              }]
-            })
-          })
-          if (resp.ok) {
-            var data = await resp.json()
-            var text = ''; data.content.forEach(function(b) { text += (b.text || '') })
-            aiData = JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim())
-            labels = aiData.labels || []
-          }
-        }
-      } catch (e2) { console.warn('Label err:', e2) }
+.fpa-btn {
+  padding: 0.6rem 1.25rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  font-weight: 500;
+  border: none;
+  cursor: pointer;
+  transition: all 0.15s;
+}
 
-      ppm = calculatePPM(wallData, aiData, w, h)
+.fpa-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
 
-      setAnalysis({
-        walls: wallData.horizontal.concat(wallData.vertical),
-        hWalls: wallData.horizontal, vWalls: wallData.vertical,
-        hCount: wallData.horizontal.length, vCount: wallData.vertical.length,
-        labels: labels, ppm: ppm, aiData: aiData,
-        imgWidth: w, imgHeight: h
-      })
-    } catch (err) { setError(err.message) }
-    finally { setLoading(false) }
+.fpa-btn-primary {
+  background: #2563eb;
+  color: white;
+}
+
+.fpa-btn-primary:hover:not(:disabled) {
+  background: #1d4ed8;
+}
+
+.fpa-btn-secondary {
+  background: #f3f4f6;
+  color: #374151;
+  border: 1px solid #d1d5db;
+}
+
+.fpa-btn-secondary:hover {
+  background: #e5e7eb;
+}
+
+/* Error */
+.fpa-error {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+/* Loading */
+.fpa-loading {
+  text-align: center;
+  padding: 2rem;
+}
+
+.fpa-spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid #e5e7eb;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin: 0 auto 1rem;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.fpa-loading p {
+  color: #374151;
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.fpa-loading-sub {
+  color: #9ca3af !important;
+  font-size: 0.85rem !important;
+  margin-top: 0.25rem !important;
+}
+
+/* Result */
+.fpa-result {
+  margin-top: 1.5rem;
+}
+
+.fpa-result-header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.fpa-result-header h2 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin: 0;
+}
+
+.fpa-result-stats {
+  color: #6b7280;
+  font-size: 0.85rem;
+}
+
+.fpa-canvas-wrap {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 1rem;
+  overflow: auto;
+  margin-bottom: 1rem;
+}
+
+.fpa-canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+/* Details / table */
+.fpa-details {
+  margin-bottom: 0.75rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.fpa-details summary {
+  padding: 0.6rem 1rem;
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 0.9rem;
+  background: #f9fafb;
+  user-select: none;
+}
+
+.fpa-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.fpa-table th, .fpa-table td {
+  padding: 0.4rem 0.75rem;
+  text-align: left;
+  border-top: 1px solid #f3f4f6;
+}
+
+.fpa-table th {
+  background: #f9fafb;
+  font-weight: 600;
+  color: #6b7280;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.fpa-json {
+  margin: 0;
+  padding: 1rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  overflow-x: auto;
+  background: #f9fafb;
+  max-height: 400px;
+}
+
+/* Responsive */
+@media (max-width: 640px) {
+  .fpa-controls {
+    flex-direction: column;
   }
-
-  useEffect(function() {
-    if (analysis && analysis.walls && analysis.walls.length > 0) drawFloorPlan()
-  }, [analysis])
-
-  var drawFloorPlan = function() {
-    var canvas = canvasRef.current
-    if (!canvas || !analysis) return
-
-    var allWalls = (analysis.hWalls || []).concat(analysis.vWalls || [])
-    if (allWalls.length === 0) return
-
-    var srcW = analysis.imgWidth, srcH = analysis.imgHeight
-    var ppm = analysis.ppm || 80
-
-    var PAD = 70
-    var scale = Math.min((900 - PAD * 2) / srcW, (800 - PAD * 2) / srcH, 1)
-    var cw = srcW * scale + PAD * 2, ch = srcH * scale + PAD * 2
-    canvas.width = cw; canvas.height = ch
-
-    var ctx = canvas.getContext('2d')
-    ctx.clearRect(0, 0, cw, ch)
-    ctx.fillStyle = '#ffffff'
-    ctx.fillRect(0, 0, cw, ch)
-
-    var X = function(px) { return PAD + px * scale }
-    var Y = function(py) { return PAD + py * scale }
-
-    // Walls
-    ctx.strokeStyle = '#1a1a1a'
-    ctx.lineWidth = Math.max(2.5, 4 * scale)
-    ctx.lineCap = 'square'
-    allWalls.forEach(function(w) {
-      ctx.beginPath()
-      ctx.moveTo(X(w.x1), Y(w.y1))
-      ctx.lineTo(X(w.x2), Y(w.y2))
-      ctx.stroke()
-    })
-
-    // Dimensions
-    ctx.fillStyle = '#2563eb'
-    allWalls.forEach(function(w) {
-      var dx = w.x2 - w.x1, dy = w.y2 - w.y1
-      var lenPx = Math.sqrt(dx * dx + dy * dy)
-      var screenLen = lenPx * scale
-      if (screenLen < 35) return
-
-      var lenM = lenPx / ppm
-      var label = lenM.toFixed(2) + 'm'
-      var fs = Math.max(8, Math.min(11, screenLen / 8))
-      ctx.font = fs + 'px "Segoe UI", system-ui, sans-serif'
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
-
-      var mx = X((w.x1 + w.x2) / 2), my = Y((w.y1 + w.y2) / 2)
-
-      if (Math.abs(dy) < 2) {
-        ctx.fillText(label, mx, my - 10)
-      } else {
-        ctx.save()
-        ctx.translate(mx - 10, my)
-        ctx.rotate(-Math.PI / 2)
-        ctx.fillText(label, 0, 0)
-        ctx.restore()
-      }
-    })
-
-    ctx.fillStyle = '#9ca3af'; ctx.font = '11px sans-serif'
-    ctx.textAlign = 'right'; ctx.textBaseline = 'top'
-    ctx.fillText('N \u2191', cw - 8, 8)
-
-    ctx.fillStyle = '#6b7280'; ctx.font = '10px sans-serif'
-    ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'
-    ctx.fillText(analysis.hCount + 'H + ' + analysis.vCount + 'V | ppm=' + (ppm || 0).toFixed(1), PAD, ch - 8)
+  .fpa-preview {
+    max-width: 100%;
   }
-
-  return (
-    <div className="fpa-root">
-      <header className="fpa-header">
-        <h1>CarpetPlan</h1>
-        <p className="fpa-subtitle">Upload a floor plan &rarr; Detect walls &amp; measure dimensions</p>
-      </header>
-
-      {!image && (
-        <div className="fpa-upload"
-          onClick={function() { fileRef.current && fileRef.current.click() }}
-          onDrop={onDrop}
-          onDragOver={function(e) { e.preventDefault(); e.currentTarget.classList.add('drag') }}
-          onDragLeave={function(e) { e.currentTarget.classList.remove('drag') }}>
-          <input ref={fileRef} type="file" accept="image/*"
-            onChange={function(e) { handleFile(e.target.files[0]) }} />
-          <span className="fpa-upload-icon">&#x1F4D0;</span>
-          <span className="fpa-upload-text">Drop floor plan image or click to browse</span>
-        </div>
-      )}
-
-      {image && (
-        <div className="fpa-controls">
-          <img src={image} alt="Floor plan" className="fpa-preview" />
-          <div className="fpa-buttons">
-            <button onClick={analyze} disabled={loading} className="fpa-btn fpa-btn-primary">
-              {loading ? 'Processing\u2026' : 'Detect Walls'}
-            </button>
-            <button onClick={function() { setImage(null); setImgSize(null); setAnalysis(null); setError(null); imgElRef.current = null }}
-              className="fpa-btn fpa-btn-secondary">Clear</button>
-          </div>
-        </div>
-      )}
-
-      {error && <div className="fpa-error">{error}</div>}
-
-      {loading && (
-        <div className="fpa-loading">
-          <div className="fpa-spinner" />
-          <p>Processing floor plan&hellip;</p>
-          <p className="fpa-loading-sub">Scanning pixels, calibrating dimensions</p>
-        </div>
-      )}
-
-      {analysis && (
-        <div className="fpa-result">
-          <div className="fpa-result-header">
-            <h2>Detected Floor Plan</h2>
-            <div className="fpa-result-stats">
-              {analysis.hCount}H &middot; {analysis.vCount}V walls
-              {analysis.ppm ? ' \u00b7 ' + analysis.ppm.toFixed(1) + ' px/m' : ''}
-            </div>
-          </div>
-          <div className="fpa-canvas-wrap">
-            <canvas ref={canvasRef} className="fpa-canvas" />
-          </div>
-          <details className="fpa-details">
-            <summary>Detection Data</summary>
-            <pre className="fpa-json">{JSON.stringify({
-              aiData: analysis.aiData, ppm: analysis.ppm, wallCount: analysis.walls.length
-            }, null, 2)}</pre>
-          </details>
-        </div>
-      )}
-    </div>
-  )
 }
