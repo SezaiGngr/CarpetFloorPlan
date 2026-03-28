@@ -5,20 +5,17 @@ const MODEL = 'claude-sonnet-4-20250514'
 const MAX_IMG_WIDTH = 1200
 
 // ─── AI PROMPT ────────────────────────────────────────────────────────────────
-// The key insight: we ask the AI to return ABSOLUTE coordinates for every room.
-// No adjacency, no grid rows, no BFS. The AI looks at the image and tells us
-// exactly where each room sits in a meter-based coordinate system.
-// The renderer just draws what the AI says — no layout engine needed.
+// Strategy: Ask AI for ONLY room positions + doors. We compute walls ourselves.
 
 const ANALYSIS_PROMPT = `You are an expert architectural floor plan analyzer.
 
 COORDINATE SYSTEM:
 - Origin (0, 0) is the TOP-LEFT corner of the entire floor plan
-- X axis goes RIGHT (increasing x = further right)  
+- X axis goes RIGHT (increasing x = further right)
 - Y axis goes DOWN (increasing y = further down)
 - All measurements are in METERS
 
-TASK: Analyze this floor plan image and return a JSON object with this EXACT structure:
+TASK: Analyze this floor plan and return JSON with rooms and doors.
 
 {
   "rooms": [
@@ -27,67 +24,318 @@ TASK: Analyze this floor plan image and return a JSON object with this EXACT str
       "x": 0,
       "y": 0,
       "width": 3.7,
-      "height": 3.0,
-      "label": "3.7 x 3.0"
-    }
-  ],
-  "walls": [
-    {
-      "x1": 0, "y1": 0, "x2": 3.7, "y2": 0,
-      "type": "exterior"
+      "height": 3.0
     }
   ],
   "doors": [
     {
-      "x": 2.0,
-      "y": 3.0,
+      "room1": "Bed 1",
+      "room2": "Hallway",
+      "wall": "bottom",
+      "position": 0.5,
       "width": 0.82,
-      "orientation": "horizontal",
-      "swing": "down-right",
-      "connects": ["Bed 1", "Hallway"]
+      "swing": "into_room2"
     }
   ]
 }
 
-CRITICAL RULES:
+RULES FOR ROOMS:
+1. Return EVERY room/area visible in the floor plan including hallways, voids, stairs, etc.
+2. Read dimension annotations carefully. "3.7 x 3.0" means width=3.7, height=3.0.
+3. Rooms that share a wall MUST have EXACTLY matching coordinates at that shared edge.
+   - If Room A right edge is at x=3.7, and Room B touches it on the right, Room B x MUST be 3.7
+   - If Room A bottom edge is at y=3.0, and Room B is below it, Room B y MUST be 3.0
+4. There must be NO gaps between adjacent rooms. Every pixel of the floor plan interior must be covered by a room.
+5. Rooms must NOT overlap.
+6. Include corridors/hallways as rooms even if they have no label. Name them "Corridor" or "Hallway".
 
-1. ROOMS: Return EVERY room visible in the floor plan. For each room, provide:
-   - "name": The room label as shown (e.g., "Bed 1", "Living", "Kitchen")
-   - "x", "y": Top-left corner position in meters from the floor plan's top-left
-   - "width": Horizontal extent (left to right) in meters
-   - "height": Vertical extent (top to bottom) in meters
-   - "label": Dimension text like "3.7 x 3.0"
-   
-   IMPORTANT: Rooms that share a wall MUST have EXACTLY matching coordinates at that wall.
-   Example: If Bed 1 goes from x=0 to x=3.7, and Bed 2 starts at Bed 1's right edge,
-   then Bed 2 must have x=3.7 (not 3.71 or 3.69).
+RULES FOR DOORS:
+1. "room1" and "room2": The two rooms the door connects (use exact room names from rooms array).
+2. "wall": Which wall of room1 the door is on: "top", "bottom", "left", or "right".
+3. "position": How far along that wall the door CENTER is, as a fraction from 0.0 to 1.0.
+   - For "top"/"bottom" walls: 0.0 = left edge, 1.0 = right edge
+   - For "left"/"right" walls: 0.0 = top edge, 1.0 = bottom edge
+4. "width": Door width in meters (typically 0.7 to 0.9)
+5. "swing": Direction door swings: "into_room1" or "into_room2"
 
-2. WALLS: Return EVERY wall segment as a line. Include:
-   - ALL exterior walls (type: "exterior")
-   - ALL interior walls between rooms (type: "interior")  
-   - Walls are straight lines. A wall along the top of a room at y=0 from x=0 to x=3.7
-     would be: {"x1": 0, "y1": 0, "x2": 3.7, "y2": 0, "type": "exterior"}
-   - Where a door exists, SPLIT the wall into two segments with a gap for the door.
-     Do NOT include the door gap as a wall segment.
-   - Interior walls shared by two rooms should appear ONCE, not twice.
+Return ONLY valid JSON. No markdown, no backticks, no explanation.`
 
-3. DOORS: Return every door with:
-   - "x", "y": The starting position of the door opening (top-left of the gap)
-   - "width": Door width in meters (typically 0.7-0.9m)
-   - "orientation": "horizontal" if the door gap is along a horizontal wall (top/bottom of room),
-                     "vertical" if along a vertical wall (left/right of room)
-   - "swing": Direction the door swings. One of:
-     "down-right", "down-left", "up-right", "up-left" (for horizontal orientation)
-     "right-down", "right-up", "left-down", "left-up" (for vertical orientation)
-   - "connects": Array of two room names the door connects
 
-4. Read dimension annotations from the image carefully. Numbers like "3.7 x 3.0" or 
-   "3700 x 3000" tell you exact room dimensions. Use these to calibrate all coordinates.
+// ─── COORDINATE SNAPPING ─────────────────────────────────────────────────────
+function snapRoomCoordinates(rooms, tolerance) {
+  if (!rooms || rooms.length === 0) return rooms
+  tolerance = tolerance || 0.15
 
-5. Rooms must tile together with NO gaps and NO overlaps. Adjacent rooms share exact edges.
+  var xVals = []
+  var yVals = []
+  rooms.forEach(function(r) {
+    xVals.push(r.x, r.x + r.width)
+    yVals.push(r.y, r.y + r.height)
+  })
 
-Return ONLY valid JSON. No markdown, no explanation, no backticks.`
+  function clusterValues(vals, tol) {
+    var sorted = []
+    var seen = {}
+    vals.forEach(function(v) {
+      var key = v.toFixed(6)
+      if (!seen[key]) { seen[key] = true; sorted.push(v) }
+    })
+    sorted.sort(function(a, b) { return a - b })
 
+    var clusters = []
+    sorted.forEach(function(v) {
+      var found = false
+      for (var ci = 0; ci < clusters.length; ci++) {
+        if (Math.abs(v - clusters[ci].avg) < tol) {
+          clusters[ci].vals.push(v)
+          var sum = 0
+          clusters[ci].vals.forEach(function(x) { sum += x })
+          clusters[ci].avg = sum / clusters[ci].vals.length
+          found = true
+          break
+        }
+      }
+      if (!found) {
+        clusters.push({ vals: [v], avg: v })
+      }
+    })
+
+    var mapping = {}
+    clusters.forEach(function(c) {
+      c.vals.forEach(function(v) {
+        mapping[v.toFixed(6)] = c.avg
+      })
+    })
+    return mapping
+  }
+
+  var xMap = clusterValues(xVals, tolerance)
+  var yMap = clusterValues(yVals, tolerance)
+
+  function snapVal(v, map) {
+    var key = v.toFixed(6)
+    if (map[key] !== undefined) return map[key]
+    var best = v, bestDist = Infinity
+    Object.keys(map).forEach(function(k) {
+      var d = Math.abs(v - parseFloat(k))
+      if (d < bestDist) { bestDist = d; best = map[k] }
+    })
+    return best
+  }
+
+  return rooms.map(function(r) {
+    var sx = snapVal(r.x, xMap)
+    var sy = snapVal(r.y, yMap)
+    var sx2 = snapVal(r.x + r.width, xMap)
+    var sy2 = snapVal(r.y + r.height, yMap)
+    return Object.assign({}, r, {
+      x: sx, y: sy,
+      width: sx2 - sx,
+      height: sy2 - sy
+    })
+  })
+}
+
+
+// ─── WALL COMPUTATION ────────────────────────────────────────────────────────
+function computeWalls(rooms, doors) {
+  var snap = 0.05
+  var rawEdges = []
+
+  rooms.forEach(function(r, ri) {
+    var x1 = r.x, y1 = r.y
+    var x2 = r.x + r.width, y2 = r.y + r.height
+    // h = horizontal (y=pos, from x=a to x=b)
+    rawEdges.push({ a: x1, b: x2, pos: y1, axis: 'h', ri: ri })
+    rawEdges.push({ a: x1, b: x2, pos: y2, axis: 'h', ri: ri })
+    // v = vertical (x=pos, from y=a to y=b)
+    rawEdges.push({ a: y1, b: y2, pos: x1, axis: 'v', ri: ri })
+    rawEdges.push({ a: y1, b: y2, pos: x2, axis: 'v', ri: ri })
+  })
+
+  // Group edges by axis + snapped position
+  var groups = {}
+  rawEdges.forEach(function(e) {
+    var roundedPos = Math.round(e.pos / snap) * snap
+    var key = e.axis + '_' + roundedPos.toFixed(4)
+    if (!groups[key]) {
+      groups[key] = { axis: e.axis, pos: e.pos, segments: [], count: 0 }
+    }
+    // Running average for position
+    groups[key].count++
+    groups[key].pos = groups[key].pos + (e.pos - groups[key].pos) / groups[key].count
+    groups[key].segments.push({ a: Math.min(e.a, e.b), b: Math.max(e.a, e.b) })
+  })
+
+  // Merge overlapping segments at each position
+  var wallSegments = []
+  Object.keys(groups).forEach(function(key) {
+    var group = groups[key]
+    var segs = group.segments.sort(function(a, b) { return a.a - b.a })
+
+    var merged = []
+    var cur = { a: segs[0].a, b: segs[0].b }
+    for (var i = 1; i < segs.length; i++) {
+      if (segs[i].a <= cur.b + snap) {
+        cur.b = Math.max(cur.b, segs[i].b)
+      } else {
+        merged.push({ a: cur.a, b: cur.b })
+        cur = { a: segs[i].a, b: segs[i].b }
+      }
+    }
+    merged.push({ a: cur.a, b: cur.b })
+
+    merged.forEach(function(seg) {
+      wallSegments.push({ axis: group.axis, pos: group.pos, a: seg.a, b: seg.b })
+    })
+  })
+
+  // Cut door gaps
+  var finalWalls = []
+  wallSegments.forEach(function(wall) {
+    var segments = [{ a: wall.a, b: wall.b }]
+
+    doors.forEach(function(door) {
+      var ds = getDoorSegment(door, rooms, snap)
+      if (!ds) return
+      if (wall.axis !== ds.axis) return
+      if (Math.abs(wall.pos - ds.pos) > snap) return
+
+      var newSegs = []
+      segments.forEach(function(seg) {
+        if (ds.b <= seg.a + snap || ds.a >= seg.b - snap) {
+          newSegs.push(seg)
+        } else {
+          if (ds.a > seg.a + snap) newSegs.push({ a: seg.a, b: ds.a })
+          if (ds.b < seg.b - snap) newSegs.push({ a: ds.b, b: seg.b })
+        }
+      })
+      segments = newSegs
+    })
+
+    segments.forEach(function(seg) {
+      if (seg.b - seg.a > snap) {
+        finalWalls.push({ axis: wall.axis, pos: wall.pos, a: seg.a, b: seg.b })
+      }
+    })
+  })
+
+  return finalWalls
+}
+
+
+function getDoorSegment(door, rooms, snap) {
+  var room1 = rooms.find(function(r) { return r.name === door.room1 })
+  if (!room1) return null
+
+  var pos = door.position != null ? door.position : 0.5
+  var dw = door.width || 0.82
+  var wallPos, wallStart, wallEnd, axis
+
+  if (door.wall === 'top') {
+    axis = 'h'; wallPos = room1.y
+    wallStart = room1.x; wallEnd = room1.x + room1.width
+  } else if (door.wall === 'bottom') {
+    axis = 'h'; wallPos = room1.y + room1.height
+    wallStart = room1.x; wallEnd = room1.x + room1.width
+  } else if (door.wall === 'left') {
+    axis = 'v'; wallPos = room1.x
+    wallStart = room1.y; wallEnd = room1.y + room1.height
+  } else if (door.wall === 'right') {
+    axis = 'v'; wallPos = room1.x + room1.width
+    wallStart = room1.y; wallEnd = room1.y + room1.height
+  } else {
+    return null
+  }
+
+  var wallLen = wallEnd - wallStart
+  var doorCenter = wallStart + wallLen * pos
+  return { axis: axis, pos: wallPos, a: doorCenter - dw / 2, b: doorCenter + dw / 2 }
+}
+
+
+// ─── DOOR ARC DRAWING ────────────────────────────────────────────────────────
+function drawDoorArc(ctx, door, rooms, X, Y, S) {
+  var room1 = rooms.find(function(r) { return r.name === door.room1 })
+  if (!room1) return
+
+  var pos = door.position != null ? door.position : 0.5
+  var dw = door.width || 0.82
+  var dwPx = S(dw)
+  var swingInto2 = door.swing !== 'into_room1'
+
+  var pivotX, pivotY, startAngle, endAngle
+
+  if (door.wall === 'bottom') {
+    var wallY = room1.y + room1.height
+    var doorCenter = room1.x + room1.width * pos
+    var doorLeft = doorCenter - dw / 2
+    var doorRight = doorCenter + dw / 2
+    if (swingInto2) {
+      pivotX = X(doorLeft); pivotY = Y(wallY)
+      startAngle = -Math.PI / 2; endAngle = 0
+    } else {
+      pivotX = X(doorRight); pivotY = Y(wallY)
+      startAngle = Math.PI; endAngle = Math.PI * 1.5
+    }
+  } else if (door.wall === 'top') {
+    var wallY2 = room1.y
+    var doorCenter2 = room1.x + room1.width * pos
+    var doorLeft2 = doorCenter2 - dw / 2
+    var doorRight2 = doorCenter2 + dw / 2
+    if (swingInto2) {
+      pivotX = X(doorRight2); pivotY = Y(wallY2)
+      startAngle = Math.PI / 2; endAngle = Math.PI
+    } else {
+      pivotX = X(doorLeft2); pivotY = Y(wallY2)
+      startAngle = 0; endAngle = Math.PI / 2
+    }
+  } else if (door.wall === 'right') {
+    var wallX = room1.x + room1.width
+    var doorCenter3 = room1.y + room1.height * pos
+    var doorTop = doorCenter3 - dw / 2
+    var doorBottom = doorCenter3 + dw / 2
+    if (swingInto2) {
+      pivotX = X(wallX); pivotY = Y(doorTop)
+      startAngle = Math.PI / 2; endAngle = Math.PI
+    } else {
+      pivotX = X(wallX); pivotY = Y(doorBottom)
+      startAngle = Math.PI; endAngle = Math.PI * 1.5
+    }
+  } else if (door.wall === 'left') {
+    var wallX2 = room1.x
+    var doorCenter4 = room1.y + room1.height * pos
+    var doorTop2 = doorCenter4 - dw / 2
+    var doorBottom2 = doorCenter4 + dw / 2
+    if (swingInto2) {
+      pivotX = X(wallX2); pivotY = Y(doorBottom2)
+      startAngle = -Math.PI / 2; endAngle = 0
+    } else {
+      pivotX = X(wallX2); pivotY = Y(doorTop2)
+      startAngle = 0; endAngle = Math.PI / 2
+    }
+  } else {
+    return
+  }
+
+  ctx.strokeStyle = '#4B5563'
+  ctx.lineWidth = 1.2
+  ctx.setLineDash([])
+  ctx.beginPath()
+  ctx.arc(pivotX, pivotY, dwPx, startAngle, endAngle, false)
+  ctx.stroke()
+
+  ctx.beginPath()
+  ctx.moveTo(pivotX, pivotY)
+  ctx.lineTo(
+    pivotX + dwPx * Math.cos(endAngle),
+    pivotY + dwPx * Math.sin(endAngle)
+  )
+  ctx.stroke()
+}
+
+
+// ─── COMPONENT ───────────────────────────────────────────────────────────────
 
 export default function FloorPlanAnalyzer() {
   const [image, setImage] = useState(null)
@@ -95,14 +343,11 @@ export default function FloorPlanAnalyzer() {
   const [analysis, setAnalysis] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
-  const [showOriginal, setShowOriginal] = useState(false)
   const canvasRef = useRef(null)
   const fileRef = useRef(null)
-  const imgRef = useRef(null)
 
-  // ─── Image Upload ──────────────────────────────────────────────────────
   const handleFile = useCallback((file) => {
-    if (!file?.type?.startsWith('image/')) return
+    if (!file || !file.type || !file.type.startsWith('image/')) return
     setError(null)
     setAnalysis(null)
 
@@ -110,18 +355,14 @@ export default function FloorPlanAnalyzer() {
     reader.onload = (e) => {
       const img = new Image()
       img.onload = () => {
-        // Resize if needed
         const scale = img.width > MAX_IMG_WIDTH ? MAX_IMG_WIDTH / img.width : 1
         const c = document.createElement('canvas')
         c.width = img.width * scale
         c.height = img.height * scale
-        const cx = c.getContext('2d')
-        cx.drawImage(img, 0, 0, c.width, c.height)
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height)
         const dataUrl = c.toDataURL('image/jpeg', 0.85)
-        const base64 = dataUrl.split(',')[1]
         setImage(dataUrl)
-        setImageData(base64)
-        imgRef.current = img
+        setImageData(dataUrl.split(',')[1])
       }
       img.src = e.target.result
     }
@@ -134,7 +375,6 @@ export default function FloorPlanAnalyzer() {
     handleFile(e.dataTransfer.files[0])
   }, [handleFile])
 
-  // ─── API Call ──────────────────────────────────────────────────────────
   const analyze = async () => {
     if (!imageData) return
     setLoading(true)
@@ -167,16 +407,23 @@ export default function FloorPlanAnalyzer() {
       })
 
       if (!resp.ok) {
-        const errData = await resp.json().catch(() => ({}))
-        throw new Error(errData?.error?.message || `API error ${resp.status}`)
+        const errData = await resp.json().catch(function() { return {} })
+        throw new Error((errData.error && errData.error.message) || ('API error ' + resp.status))
       }
 
       const data = await resp.json()
-      const text = data.content?.map(b => b.text || '').join('') || ''
-      const clean = text.replace(/```json|```/g, '').trim()
-      const parsed = JSON.parse(clean)
+      var text = ''
+      if (data.content) {
+        data.content.forEach(function(b) { text += (b.text || '') })
+      }
+      var clean = text.replace(/```json/g, '').replace(/```/g, '').trim()
+      var parsed = JSON.parse(clean)
 
-      if (!parsed.rooms?.length) throw new Error('No rooms found in analysis')
+      if (!parsed.rooms || parsed.rooms.length === 0) throw new Error('No rooms found')
+
+      // POST-PROCESS: Snap coordinates to eliminate gaps
+      parsed.rooms = snapRoomCoordinates(parsed.rooms)
+
       setAnalysis(parsed)
     } catch (err) {
       setError(err.message)
@@ -185,124 +432,111 @@ export default function FloorPlanAnalyzer() {
     }
   }
 
-  // ─── Draw Floor Plan ──────────────────────────────────────────────────
   useEffect(() => {
-    if (!analysis?.rooms?.length) return
-    drawFloorPlan()
-  }, [analysis, showOriginal])
+    if (analysis && analysis.rooms && analysis.rooms.length > 0) {
+      drawFloorPlan()
+    }
+  }, [analysis])
 
   const drawFloorPlan = () => {
     const canvas = canvasRef.current
     if (!canvas || !analysis) return
 
     const rooms = analysis.rooms || []
-    const walls = analysis.walls || []
     const doors = analysis.doors || []
-
     if (rooms.length === 0) return
 
-    // ── Scale calculation ──────────────────────────────────────────────
-    // Find bounding box of all rooms
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-    rooms.forEach(r => {
+    // Bounding box
+    var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    rooms.forEach(function(r) {
       minX = Math.min(minX, r.x)
       minY = Math.min(minY, r.y)
       maxX = Math.max(maxX, r.x + r.width)
       maxY = Math.max(maxY, r.y + r.height)
     })
 
-    const totalW = maxX - minX
-    const totalH = maxY - minY
+    var totalW = maxX - minX
+    var totalH = maxY - minY
 
-    // Canvas sizing
-    const PAD = 70  // padding for dimension labels
-    const PX_PER_M = Math.min(
-      (800 - PAD * 2) / totalW,
-      (700 - PAD * 2) / totalH,
-      100  // max zoom
+    var PAD = 70
+    var PX_PER_M = Math.min(
+      (850 - PAD * 2) / totalW,
+      (750 - PAD * 2) / totalH,
+      100
     )
 
-    const cw = totalW * PX_PER_M + PAD * 2
-    const ch = totalH * PX_PER_M + PAD * 2
+    var cw = totalW * PX_PER_M + PAD * 2
+    var ch = totalH * PX_PER_M + PAD * 2
 
     canvas.width = cw
     canvas.height = ch
 
-    const ctx = canvas.getContext('2d')
+    var ctx = canvas.getContext('2d')
     ctx.clearRect(0, 0, cw, ch)
-
-    // White background
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, cw, ch)
 
-    // Coordinate transforms (meters → canvas pixels)
-    const X = (m) => PAD + (m - minX) * PX_PER_M
-    const Y = (m) => PAD + (m - minY) * PX_PER_M
-    const S = (m) => m * PX_PER_M
+    var Xfn = function(m) { return PAD + (m - minX) * PX_PER_M }
+    var Yfn = function(m) { return PAD + (m - minY) * PX_PER_M }
+    var Sfn = function(m) { return m * PX_PER_M }
 
-    // ── Room fills ─────────────────────────────────────────────────────
-    const ROOM_COLORS = [
-      '#F0F7FF', '#FFF7ED', '#F0FDF4', '#FDF2F8', '#FFFBEB',
-      '#F5F3FF', '#ECFDF5', '#FEF2F2', '#EFF6FF', '#FFF1F2'
+    // Room fills
+    var COLORS = [
+      '#E8F0FE', '#FFF3E0', '#E8F5E9', '#FCE4EC', '#FFF8E1',
+      '#F3E5F5', '#E0F2F1', '#FFEBEE', '#E3F2FD', '#FBE9E7'
     ]
-
-    rooms.forEach((r, i) => {
-      ctx.fillStyle = ROOM_COLORS[i % ROOM_COLORS.length]
-      ctx.fillRect(X(r.x), Y(r.y), S(r.width), S(r.height))
+    rooms.forEach(function(r, i) {
+      ctx.fillStyle = COLORS[i % COLORS.length]
+      ctx.fillRect(Xfn(r.x), Yfn(r.y), Sfn(r.width), Sfn(r.height))
     })
 
-    // ── Draw ALL walls ─────────────────────────────────────────────────
-    // If AI provided explicit walls, use them.
-    // Otherwise, compute walls from room edges.
+    // Compute and draw walls — ALL walls same thickness
+    var walls = computeWalls(rooms, doors)
+    var WALL_THICKNESS = 4
 
-    const WALL_W_EXT = 4    // exterior wall thickness
-    const WALL_W_INT = 2.5  // interior wall thickness
+    ctx.strokeStyle = '#1a1a1a'
+    ctx.lineWidth = WALL_THICKNESS
+    ctx.lineCap = 'square'
 
-    if (walls.length > 0) {
-      // Draw AI-provided walls
-      walls.forEach(w => {
-        ctx.beginPath()
-        ctx.moveTo(X(w.x1), Y(w.y1))
-        ctx.lineTo(X(w.x2), Y(w.y2))
-        ctx.strokeStyle = '#1a1a1a'
-        ctx.lineWidth = w.type === 'exterior' ? WALL_W_EXT : WALL_W_INT
-        ctx.lineCap = 'round'
-        ctx.stroke()
-      })
-    } else {
-      // Fallback: compute walls from room edges
-      drawWallsFromRooms(ctx, rooms, doors, X, Y, S, WALL_W_EXT, WALL_W_INT)
-    }
-
-    // ── Draw doors ─────────────────────────────────────────────────────
-    doors.forEach(door => {
-      drawDoor(ctx, door, X, Y, S)
+    walls.forEach(function(w) {
+      ctx.beginPath()
+      if (w.axis === 'h') {
+        ctx.moveTo(Xfn(w.a), Yfn(w.pos))
+        ctx.lineTo(Xfn(w.b), Yfn(w.pos))
+      } else {
+        ctx.moveTo(Xfn(w.pos), Yfn(w.a))
+        ctx.lineTo(Xfn(w.pos), Yfn(w.b))
+      }
+      ctx.stroke()
     })
 
-    // ── Room labels ────────────────────────────────────────────────────
-    rooms.forEach(r => {
-      const cx = X(r.x + r.width / 2)
-      const cy = Y(r.y + r.height / 2)
-      const fontSize = Math.max(10, Math.min(14, S(Math.min(r.width, r.height)) / 6))
+    // Draw door arcs
+    doors.forEach(function(door) {
+      drawDoorArc(ctx, door, rooms, Xfn, Yfn, Sfn)
+    })
 
-      // Room name
+    // Room labels
+    rooms.forEach(function(r) {
+      var cx = Xfn(r.x + r.width / 2)
+      var cy = Yfn(r.y + r.height / 2)
+      var fs = Math.max(10, Math.min(14, Sfn(Math.min(r.width, r.height)) / 6))
+
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
       ctx.fillStyle = '#1f2937'
-      ctx.font = `600 ${fontSize}px "Segoe UI", system-ui, sans-serif`
-      ctx.fillText(r.name, cx, cy - fontSize * 0.7)
+      ctx.font = '600 ' + fs + 'px "Segoe UI", system-ui, sans-serif'
+      ctx.fillText(r.name, cx, cy - fs * 0.7)
 
-      // Dimensions
       ctx.fillStyle = '#6b7280'
-      ctx.font = `400 ${fontSize * 0.85}px "Segoe UI", system-ui, sans-serif`
-      const dimText = r.label || `${r.width.toFixed(1)} × ${r.height.toFixed(1)}`
-      ctx.fillText(dimText, cx, cy + fontSize * 0.5)
+      ctx.font = '400 ' + (fs * 0.85) + 'px "Segoe UI", system-ui, sans-serif'
+      var dimText = r.label || (r.width.toFixed(1) + ' x ' + r.height.toFixed(1))
+      ctx.fillText(dimText, cx, cy + fs * 0.5)
     })
 
-    // ── Dimension lines (outside the floor plan) ───────────────────────
-    drawDimensionLines(ctx, rooms, X, Y, S, PAD, minX, minY, maxX, maxY)
+    // Dimension lines
+    drawDimensions(ctx, rooms, Xfn, Yfn, Sfn, PAD, minX, minY, maxX, maxY)
 
-    // ── North arrow ────────────────────────────────────────────────────
+    // North arrow
     ctx.fillStyle = '#9ca3af'
     ctx.font = '11px sans-serif'
     ctx.textAlign = 'right'
@@ -310,430 +544,149 @@ export default function FloorPlanAnalyzer() {
     ctx.fillText('N ↑', cw - 8, 8)
   }
 
-  // ─── Compute walls from room edges (fallback) ─────────────────────────
-  const drawWallsFromRooms = (ctx, rooms, doors, X, Y, S, wallExt, wallInt) => {
-    // Collect all edges from all rooms
-    // An edge is: {x1, y1, x2, y2, roomIndex}
-    // We'll detect shared edges = interior walls, unshared = exterior walls
-
-    const SNAP = 0.05  // 5cm tolerance for matching edges
-
-    const edges = []
-    rooms.forEach((r, idx) => {
-      // Top edge (left to right)
-      edges.push({ x1: r.x, y1: r.y, x2: r.x + r.width, y2: r.y, ri: idx })
-      // Bottom edge
-      edges.push({ x1: r.x, y1: r.y + r.height, x2: r.x + r.width, y2: r.y + r.height, ri: idx })
-      // Left edge (top to bottom)
-      edges.push({ x1: r.x, y1: r.y, x2: r.x, y2: r.y + r.height, ri: idx })
-      // Right edge
-      edges.push({ x1: r.x + r.width, y1: r.y, x2: r.x + r.width, y2: r.y + r.height, ri: idx })
-    })
-
-    // Normalize edges so x1<=x2 and y1<=y2 for comparison
-    const norm = (e) => ({
-      ...e,
-      x1: Math.min(e.x1, e.x2),
-      y1: Math.min(e.y1, e.y2),
-      x2: Math.max(e.x1, e.x2),
-      y2: Math.max(e.y1, e.y2)
-    })
-
-    const normed = edges.map(norm)
-
-    // Check if two edges overlap (share a segment)
-    const isHorizontal = (e) => Math.abs(e.y1 - e.y2) < SNAP
-    const isVertical = (e) => Math.abs(e.x1 - e.x2) < SNAP
-
-    // Find which edges are shared (interior) vs unique (exterior)
-    const edgeType = new Array(edges.length).fill('exterior')
-
-    for (let i = 0; i < normed.length; i++) {
-      for (let j = i + 1; j < normed.length; j++) {
-        if (normed[i].ri === normed[j].ri) continue // same room
-
-        const a = normed[i], b = normed[j]
-
-        if (isHorizontal(a) && isHorizontal(b)) {
-          // Both horizontal — check if same y and overlapping x range
-          if (Math.abs(a.y1 - b.y1) < SNAP) {
-            const overlapStart = Math.max(a.x1, b.x1)
-            const overlapEnd = Math.min(a.x2, b.x2)
-            if (overlapEnd - overlapStart > SNAP) {
-              edgeType[i] = 'interior'
-              edgeType[j] = 'interior'
-            }
-          }
-        } else if (isVertical(a) && isVertical(b)) {
-          // Both vertical — check if same x and overlapping y range
-          if (Math.abs(a.x1 - b.x1) < SNAP) {
-            const overlapStart = Math.max(a.y1, b.y1)
-            const overlapEnd = Math.min(a.y2, b.y2)
-            if (overlapEnd - overlapStart > SNAP) {
-              edgeType[i] = 'interior'
-              edgeType[j] = 'interior'
-            }
-          }
-        }
-      }
-    }
-
-    // Build wall segments, splitting for doors
-    const doorSegments = doors.map(d => {
-      if (d.orientation === 'horizontal') {
-        return { x1: d.x, y1: d.y, x2: d.x + d.width, y2: d.y, horiz: true }
-      } else {
-        return { x1: d.x, y1: d.y, x2: d.x, y2: d.y + d.width, horiz: false }
-      }
-    })
-
-    // Draw each edge, splitting around doors
-    normed.forEach((edge, idx) => {
-      const type = edgeType[idx]
-      const lw = type === 'exterior' ? wallExt : wallInt
-
-      // Check if any door intersects this edge
-      const isH = isHorizontal(edge)
-      const isV = isVertical(edge)
-
-      // Find doors on this edge
-      const doorsOnEdge = doorSegments.filter(ds => {
-        if (isH && ds.horiz) {
-          return Math.abs(ds.y1 - edge.y1) < SNAP &&
-                 ds.x1 >= edge.x1 - SNAP && ds.x2 <= edge.x2 + SNAP
-        }
-        if (isV && !ds.horiz) {
-          return Math.abs(ds.x1 - edge.x1) < SNAP &&
-                 ds.y1 >= edge.y1 - SNAP && ds.y2 <= edge.y2 + SNAP
-        }
-        return false
-      })
-
-      if (doorsOnEdge.length === 0) {
-        // Draw full edge
-        ctx.beginPath()
-        ctx.moveTo(X(edge.x1), Y(edge.y1))
-        ctx.lineTo(X(edge.x2), Y(edge.y2))
-        ctx.strokeStyle = '#1a1a1a'
-        ctx.lineWidth = lw
-        ctx.lineCap = 'round'
-        ctx.stroke()
-      } else {
-        // Split edge around door gaps
-        if (isH) {
-          // Sort doors by x position
-          const sorted = doorsOnEdge.sort((a, b) => a.x1 - b.x1)
-          let curX = edge.x1
-          sorted.forEach(ds => {
-            if (ds.x1 > curX + SNAP) {
-              ctx.beginPath()
-              ctx.moveTo(X(curX), Y(edge.y1))
-              ctx.lineTo(X(ds.x1), Y(edge.y1))
-              ctx.strokeStyle = '#1a1a1a'
-              ctx.lineWidth = lw
-              ctx.lineCap = 'round'
-              ctx.stroke()
-            }
-            curX = ds.x2
-          })
-          if (curX < edge.x2 - SNAP) {
-            ctx.beginPath()
-            ctx.moveTo(X(curX), Y(edge.y1))
-            ctx.lineTo(X(edge.x2), Y(edge.y1))
-            ctx.strokeStyle = '#1a1a1a'
-            ctx.lineWidth = lw
-            ctx.lineCap = 'round'
-            ctx.stroke()
-          }
-        } else {
-          // Vertical — sort doors by y
-          const sorted = doorsOnEdge.sort((a, b) => a.y1 - b.y1)
-          let curY = edge.y1
-          sorted.forEach(ds => {
-            if (ds.y1 > curY + SNAP) {
-              ctx.beginPath()
-              ctx.moveTo(X(edge.x1), Y(curY))
-              ctx.lineTo(X(edge.x1), Y(ds.y1))
-              ctx.strokeStyle = '#1a1a1a'
-              ctx.lineWidth = lw
-              ctx.lineCap = 'round'
-              ctx.stroke()
-            }
-            curY = ds.y2
-          })
-          if (curY < edge.y2 - SNAP) {
-            ctx.beginPath()
-            ctx.moveTo(X(edge.x1), Y(curY))
-            ctx.lineTo(X(edge.x1), Y(edge.y2))
-            ctx.strokeStyle = '#1a1a1a'
-            ctx.lineWidth = lw
-            ctx.lineCap = 'round'
-            ctx.stroke()
-          }
-        }
-      }
-    })
-  }
-
-  // ─── Draw a single door ───────────────────────────────────────────────
-  const drawDoor = (ctx, door, X, Y, S) => {
-    const dw = S(door.width)
-    const dx = X(door.x)
-    const dy = Y(door.y)
-    const sw = door.swing || 'down-right'
-
-    ctx.strokeStyle = '#4B5563'
-    ctx.lineWidth = 1.5
-
-    if (door.orientation === 'horizontal') {
-      // Door gap is along a horizontal wall
-      // Draw the swing arc
-      let startAngle, endAngle, pivotX, pivotY
-
-      if (sw.includes('down') && sw.includes('right')) {
-        pivotX = dx; pivotY = dy
-        startAngle = 0; endAngle = Math.PI / 2
-      } else if (sw.includes('down') && sw.includes('left')) {
-        pivotX = dx + dw; pivotY = dy
-        startAngle = Math.PI / 2; endAngle = Math.PI
-      } else if (sw.includes('up') && sw.includes('right')) {
-        pivotX = dx; pivotY = dy
-        startAngle = -Math.PI / 2; endAngle = 0
-      } else if (sw.includes('up') && sw.includes('left')) {
-        pivotX = dx + dw; pivotY = dy
-        startAngle = Math.PI; endAngle = Math.PI * 1.5
-      } else {
-        pivotX = dx; pivotY = dy
-        startAngle = 0; endAngle = Math.PI / 2
-      }
-
-      // Draw door panel line
-      ctx.beginPath()
-      const panelEndX = pivotX + dw * Math.cos(startAngle)
-      const panelEndY = pivotY + dw * Math.sin(startAngle)
-      // For a closed door, the panel sits in the opening
-      // Draw the arc
-      ctx.beginPath()
-      ctx.arc(pivotX, pivotY, dw, startAngle, endAngle, false)
-      ctx.stroke()
-
-      // Door panel (line from pivot to arc start)
-      ctx.beginPath()
-      ctx.moveTo(pivotX, pivotY)
-      ctx.lineTo(pivotX + dw * Math.cos(endAngle), pivotY + dw * Math.sin(endAngle))
-      ctx.stroke()
-
-    } else {
-      // Door gap along a vertical wall
-      let startAngle, endAngle, pivotX, pivotY
-
-      if (sw.includes('right') && sw.includes('down')) {
-        pivotX = dx; pivotY = dy
-        startAngle = 0; endAngle = Math.PI / 2
-      } else if (sw.includes('right') && sw.includes('up')) {
-        pivotX = dx; pivotY = dy + dw
-        startAngle = -Math.PI / 2; endAngle = 0
-      } else if (sw.includes('left') && sw.includes('down')) {
-        pivotX = dx; pivotY = dy
-        startAngle = Math.PI / 2; endAngle = Math.PI
-      } else if (sw.includes('left') && sw.includes('up')) {
-        pivotX = dx; pivotY = dy + dw
-        startAngle = Math.PI; endAngle = Math.PI * 1.5
-      } else {
-        pivotX = dx; pivotY = dy
-        startAngle = 0; endAngle = Math.PI / 2
-      }
-
-      ctx.beginPath()
-      ctx.arc(pivotX, pivotY, dw, startAngle, endAngle, false)
-      ctx.stroke()
-
-      ctx.beginPath()
-      ctx.moveTo(pivotX, pivotY)
-      ctx.lineTo(pivotX + dw * Math.cos(endAngle), pivotY + dw * Math.sin(endAngle))
-      ctx.stroke()
-    }
-  }
-
-  // ─── Dimension lines ──────────────────────────────────────────────────
-  const drawDimensionLines = (ctx, rooms, X, Y, S, PAD, minX, minY, maxX, maxY) => {
-    // Draw dimension lines for overall width/height and individual rooms along edges
-
-    const TICK = 6
-    const OFFSET = 25
-    const FONT = '11px "Segoe UI", system-ui, sans-serif'
-
+  const drawDimensions = (ctx, rooms, X, Y, S, PAD, minX, minY, maxX, maxY) => {
+    var TICK = 6, OFFSET = 25
     ctx.strokeStyle = '#6b7280'
     ctx.fillStyle = '#4b5563'
-    ctx.lineWidth = 1
-    ctx.font = FONT
+    ctx.lineWidth = 0.8
+    ctx.font = '11px "Segoe UI", system-ui, sans-serif'
 
-    // Helper: draw a dimension line with ticks and label
-    const dimLine = (ax, ay, bx, by, label, side) => {
+    var dimH = function(x1, x2, y, label, above) {
+      var ly = above ? y - OFFSET : y + OFFSET
       ctx.beginPath()
-
-      if (side === 'top' || side === 'bottom') {
-        const ly = side === 'top' ? ay - OFFSET : ay + OFFSET
-        // Extension lines
-        ctx.moveTo(ax, ay); ctx.lineTo(ax, ly)
-        ctx.moveTo(bx, by); ctx.lineTo(bx, ly)
-        // Main line
-        ctx.moveTo(ax, ly); ctx.lineTo(bx, ly)
-        // Ticks
-        ctx.moveTo(ax, ly - TICK); ctx.lineTo(ax, ly + TICK)
-        ctx.moveTo(bx, ly - TICK); ctx.lineTo(bx, ly + TICK)
-        ctx.stroke()
-        // Label
-        ctx.textAlign = 'center'
-        ctx.textBaseline = side === 'top' ? 'bottom' : 'top'
-        ctx.fillText(label, (ax + bx) / 2, ly + (side === 'top' ? -4 : 4))
-      } else {
-        const lx = side === 'left' ? ax - OFFSET : ax + OFFSET
-        ctx.moveTo(ax, ay); ctx.lineTo(lx, ay)
-        ctx.moveTo(bx, by); ctx.lineTo(lx, by)
-        ctx.moveTo(lx, ay); ctx.lineTo(lx, by)
-        ctx.moveTo(lx - TICK, ay); ctx.lineTo(lx + TICK, ay)
-        ctx.moveTo(lx - TICK, by); ctx.lineTo(lx + TICK, by)
-        ctx.stroke()
-
-        ctx.save()
-        ctx.translate(lx + (side === 'left' ? -4 : 4), (ay + by) / 2)
-        ctx.rotate(-Math.PI / 2)
-        ctx.textAlign = 'center'
-        ctx.textBaseline = side === 'left' ? 'bottom' : 'top'
-        ctx.fillText(label, 0, 0)
-        ctx.restore()
-      }
+      ctx.moveTo(x1, y); ctx.lineTo(x1, ly)
+      ctx.moveTo(x2, y); ctx.lineTo(x2, ly)
+      ctx.moveTo(x1, ly); ctx.lineTo(x2, ly)
+      ctx.moveTo(x1, ly - TICK); ctx.lineTo(x1, ly + TICK)
+      ctx.moveTo(x2, ly - TICK); ctx.lineTo(x2, ly + TICK)
+      ctx.stroke()
+      ctx.textAlign = 'center'
+      ctx.textBaseline = above ? 'bottom' : 'top'
+      ctx.fillText(label, (x1 + x2) / 2, ly + (above ? -3 : 3))
     }
 
-    // Overall dimensions
-    dimLine(X(minX), Y(minY), X(maxX), Y(minY),
-      `${(maxX - minX).toFixed(2)}m`, 'top')
-    dimLine(X(minX), Y(minY), X(minX), Y(maxY),
-      `${(maxY - minY).toFixed(2)}m`, 'left')
+    var dimV = function(y1, y2, x, label, left) {
+      var lx = left ? x - OFFSET : x + OFFSET
+      ctx.beginPath()
+      ctx.moveTo(x, y1); ctx.lineTo(lx, y1)
+      ctx.moveTo(x, y2); ctx.lineTo(lx, y2)
+      ctx.moveTo(lx, y1); ctx.lineTo(lx, y2)
+      ctx.moveTo(lx - TICK, y1); ctx.lineTo(lx + TICK, y1)
+      ctx.moveTo(lx - TICK, y2); ctx.lineTo(lx + TICK, y2)
+      ctx.stroke()
+      ctx.save()
+      ctx.translate(lx + (left ? -4 : 4), (y1 + y2) / 2)
+      ctx.rotate(-Math.PI / 2)
+      ctx.textAlign = 'center'
+      ctx.textBaseline = left ? 'bottom' : 'top'
+      ctx.fillText(label, 0, 0)
+      ctx.restore()
+    }
 
-    // Individual room dimensions along bottom and right edges
-    // Find rooms along bottom edge
-    const bottomRooms = rooms.filter(r =>
-      Math.abs((r.y + r.height) - maxY) < 0.1
-    ).sort((a, b) => a.x - b.x)
+    // Overall
+    dimH(X(minX), X(maxX), Y(minY), (maxX - minX).toFixed(2) + 'm', true)
+    dimV(Y(minY), Y(maxY), X(minX), (maxY - minY).toFixed(2) + 'm', true)
 
-    if (bottomRooms.length > 1) {
-      bottomRooms.forEach(r => {
-        dimLine(X(r.x), Y(maxY), X(r.x + r.width), Y(maxY),
-          `${r.width.toFixed(1)}m`, 'bottom')
+    // Per-room on right edge
+    var rightRooms = rooms
+      .filter(function(r) { return Math.abs((r.x + r.width) - maxX) < 0.15 })
+      .sort(function(a, b) { return a.y - b.y })
+    if (rightRooms.length > 1) {
+      rightRooms.forEach(function(r) {
+        dimV(Y(r.y), Y(r.y + r.height), X(maxX), r.height.toFixed(1) + 'm', false)
       })
     }
 
-    // Find rooms along right edge
-    const rightRooms = rooms.filter(r =>
-      Math.abs((r.x + r.width) - maxX) < 0.1
-    ).sort((a, b) => a.y - b.y)
-
-    if (rightRooms.length > 1) {
-      rightRooms.forEach(r => {
-        dimLine(X(maxX), Y(r.y), X(maxX), Y(r.y + r.height),
-          `${r.height.toFixed(1)}m`, 'right')
+    // Per-room on bottom edge
+    var bottomRooms = rooms
+      .filter(function(r) { return Math.abs((r.y + r.height) - maxY) < 0.15 })
+      .sort(function(a, b) { return a.x - b.x })
+    if (bottomRooms.length > 1) {
+      bottomRooms.forEach(function(r) {
+        dimH(X(r.x), X(r.x + r.width), Y(maxY), r.width.toFixed(1) + 'm', false)
       })
     }
   }
 
 
-  // ─── UI ────────────────────────────────────────────────────────────────
   return (
     <div className="fpa-root">
       <header className="fpa-header">
         <h1>CarpetPlan</h1>
-        <p className="fpa-subtitle">Upload a floor plan → Get accurate architectural drawings</p>
+        <p className="fpa-subtitle">Upload a floor plan &rarr; Get accurate architectural drawings</p>
       </header>
 
-      {/* Upload zone */}
       {!image && (
         <div
           className="fpa-upload"
-          onClick={() => fileRef.current?.click()}
+          onClick={() => fileRef.current && fileRef.current.click()}
           onDrop={onDrop}
           onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('drag') }}
           onDragLeave={(e) => e.currentTarget.classList.remove('drag')}
         >
-          <input
-            ref={fileRef}
-            type="file"
-            accept="image/*"
-            onChange={(e) => handleFile(e.target.files[0])}
-          />
+          <input ref={fileRef} type="file" accept="image/*"
+            onChange={(e) => handleFile(e.target.files[0])} />
           <span className="fpa-upload-icon">📐</span>
           <span className="fpa-upload-text">Drop floor plan image or click to browse</span>
         </div>
       )}
 
-      {/* Image preview + controls */}
       {image && (
         <div className="fpa-controls">
           <img src={image} alt="Floor plan" className="fpa-preview" />
           <div className="fpa-buttons">
-            <button
-              onClick={analyze}
-              disabled={loading}
-              className="fpa-btn fpa-btn-primary"
-            >
-              {loading ? 'Analyzing…' : 'Analyze Floor Plan'}
+            <button onClick={analyze} disabled={loading}
+              className="fpa-btn fpa-btn-primary">
+              {loading ? 'Analyzing\u2026' : 'Analyze Floor Plan'}
             </button>
-            <button
-              onClick={() => { setImage(null); setImageData(null); setAnalysis(null); setError(null) }}
-              className="fpa-btn fpa-btn-secondary"
-            >
+            <button onClick={() => { setImage(null); setImageData(null); setAnalysis(null); setError(null) }}
+              className="fpa-btn fpa-btn-secondary">
               Clear
             </button>
           </div>
         </div>
       )}
 
-      {/* Error */}
       {error && <div className="fpa-error">{error}</div>}
 
-      {/* Loading */}
       {loading && (
         <div className="fpa-loading">
           <div className="fpa-spinner" />
-          <p>Analyzing floor plan with AI…</p>
-          <p className="fpa-loading-sub">Identifying rooms, walls, doors, and dimensions</p>
+          <p>Analyzing floor plan with AI&hellip;</p>
+          <p className="fpa-loading-sub">Identifying rooms, walls, and doors</p>
         </div>
       )}
 
-      {/* Result */}
       {analysis && (
         <div className="fpa-result">
           <div className="fpa-result-header">
             <h2>Floor Plan Drawing</h2>
             <div className="fpa-result-stats">
-              {analysis.rooms?.length || 0} rooms · {analysis.doors?.length || 0} doors · {analysis.walls?.length || 0} wall segments
+              {(analysis.rooms && analysis.rooms.length) || 0} rooms &middot; {(analysis.doors && analysis.doors.length) || 0} doors
             </div>
           </div>
           <div className="fpa-canvas-wrap">
             <canvas ref={canvasRef} className="fpa-canvas" />
           </div>
 
-          {/* Room list */}
           <details className="fpa-details">
             <summary>Room Details</summary>
             <table className="fpa-table">
               <thead>
-                <tr><th>Room</th><th>Position (x, y)</th><th>Size (w × h)</th></tr>
+                <tr><th>Room</th><th>Position (x, y)</th><th>Size (w &times; h)</th></tr>
               </thead>
               <tbody>
                 {analysis.rooms.map((r, i) => (
                   <tr key={i}>
                     <td>{r.name}</td>
                     <td>{r.x.toFixed(2)}, {r.y.toFixed(2)}</td>
-                    <td>{r.width.toFixed(2)} × {r.height.toFixed(2)} m</td>
+                    <td>{r.width.toFixed(2)} &times; {r.height.toFixed(2)} m</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </details>
 
-          {/* Debug JSON */}
           <details className="fpa-details">
             <summary>Raw AI Response</summary>
             <pre className="fpa-json">{JSON.stringify(analysis, null, 2)}</pre>
