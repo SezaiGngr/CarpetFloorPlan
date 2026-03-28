@@ -5,60 +5,119 @@ const MODEL = 'claude-sonnet-4-20250514'
 const MAX_IMG_WIDTH = 1200
 
 // ─── AI PROMPT ────────────────────────────────────────────────────────────────
-// Strategy: Ask AI for ONLY room positions + doors. We compute walls ourselves.
+// TWO-PHASE approach:
+// Phase 1: AI describes layout column-by-column, top-to-bottom
+// Phase 2: Code computes exact coordinates from description
+//
+// This is MUCH easier for the AI than absolute coordinates because
+// it only needs to say "these rooms are stacked vertically in this column"
+// and give dimensions. The code handles all positioning math.
 
 const ANALYSIS_PROMPT = `You are an expert architectural floor plan analyzer.
 
-COORDINATE SYSTEM:
-- Origin (0, 0) is the TOP-LEFT corner of the entire floor plan
-- X axis goes RIGHT (increasing x = further right)
-- Y axis goes DOWN (increasing y = further down)
-- All measurements are in METERS
+Analyze this floor plan image. Describe the layout as VERTICAL COLUMNS of rooms, read from LEFT to RIGHT across the floor plan. Within each column, list rooms from TOP to BOTTOM.
 
-TASK: Analyze this floor plan and return JSON with rooms and doors.
+Return this EXACT JSON format:
 
 {
-  "rooms": [
+  "total_width": 9.2,
+  "total_height": 12.9,
+  "columns": [
     {
-      "name": "Bed 1",
       "x": 0,
-      "y": 0,
       "width": 3.7,
-      "height": 3.0
+      "rooms": [
+        { "name": "Bed 1", "height": 3.7 },
+        { "name": "Bath", "height": 2.4 },
+        { "name": "Void", "height": 2.5 },
+        { "name": "Living", "height": 4.3 }
+      ]
+    },
+    {
+      "x": 3.7,
+      "width": 5.5,
+      "rooms": [
+        { "name": "Bed 2", "height": 3.7 },
+        { "name": "Room 3.8x3.9M", "height": 3.9 },
+        { "name": "Room 3.8x3.8M", "height": 3.8 },
+        { "name": "Room 5.1x2.4M", "height": 2.4 }
+      ]
     }
   ],
   "doors": [
     {
       "room1": "Bed 1",
-      "room2": "Hallway",
+      "room2": "Bath",
       "wall": "bottom",
-      "position": 0.5,
+      "position": 0.7,
       "width": 0.82,
-      "swing": "into_room2"
+      "hinge": "left"
     }
   ]
 }
 
-RULES FOR ROOMS:
-1. Return EVERY room/area visible in the floor plan including hallways, voids, stairs, etc.
-2. Read dimension annotations carefully. "3.7 x 3.0" means width=3.7, height=3.0.
-3. Rooms that share a wall MUST have EXACTLY matching coordinates at that shared edge.
-   - If Room A right edge is at x=3.7, and Room B touches it on the right, Room B x MUST be 3.7
-   - If Room A bottom edge is at y=3.0, and Room B is below it, Room B y MUST be 3.0
-4. There must be NO gaps between adjacent rooms. Every pixel of the floor plan interior must be covered by a room.
-5. Rooms must NOT overlap.
-6. Include corridors/hallways as rooms even if they have no label. Name them "Corridor" or "Hallway".
+RULES:
 
-RULES FOR DOORS:
-1. "room1" and "room2": The two rooms the door connects (use exact room names from rooms array).
-2. "wall": Which wall of room1 the door is on: "top", "bottom", "left", or "right".
-3. "position": How far along that wall the door CENTER is, as a fraction from 0.0 to 1.0.
-   - For "top"/"bottom" walls: 0.0 = left edge, 1.0 = right edge
-   - For "left"/"right" walls: 0.0 = top edge, 1.0 = bottom edge
-4. "width": Door width in meters (typically 0.7 to 0.9)
-5. "swing": Direction door swings: "into_room1" or "into_room2"
+1. COLUMNS: Divide the floor plan into vertical columns. Each column contains rooms stacked top-to-bottom.
+   - "x": The left edge x-position of this column in meters (first column starts at 0)
+   - "width": The width of this column in meters
+   - Adjacent columns must have x values that add up correctly: column[i].x + column[i].width = column[i+1].x
+   - A room may span multiple columns. If so, include it ONLY in the leftmost column it occupies and set its width to the actual room width.
+
+2. ROOMS within each column: Listed top-to-bottom.
+   - "name": The label shown in the floor plan (e.g., "3.7 x 3.7M", "BATH", "VOID")
+   - "height": The room's height (vertical extent) in meters
+   - The sum of all room heights in a column should equal the total height used by rooms in that column
+   - If a room is wider than its column, add "width": actualWidth to override
+   - If a room doesn't start at the same x as its column, add "x_offset": offset in meters
+
+3. Read dimension annotations from the image VERY carefully.
+   - "3.7 x 3.7M" means width = 3.7m, height = 3.7m
+   - "5.5 x 3.7M" means width = 5.5m, height = 3.7m
+   - First number is ALWAYS width (horizontal), second is ALWAYS height (vertical)
+
+4. Include ALL rooms, hallways, corridors, voids, stairs visible in the image.
+
+5. DOORS:
+   - "room1", "room2": Names of rooms the door connects
+   - "wall": Which wall of room1: "top", "bottom", "left", "right"
+   - "position": 0.0-1.0 fraction along that wall (0=start, 1=end)
+   - "width": Door width in meters (typically 0.7-0.9)
+   - "hinge": Which side the hinge is on when looking at the wall from room1: "left" or "right"
 
 Return ONLY valid JSON. No markdown, no backticks, no explanation.`
+
+
+// ─── CONVERT COLUMN LAYOUT TO ROOM RECTANGLES ───────────────────────────────
+function columnsToRooms(data) {
+  var rooms = []
+  var columns = data.columns || []
+
+  columns.forEach(function(col) {
+    var curY = 0
+    var colX = col.x || 0
+    var colW = col.width || 3
+
+    ;(col.rooms || []).forEach(function(room) {
+      var rw = room.width || colW
+      var rh = room.height || 3
+      var rx = colX + (room.x_offset || 0)
+
+      rooms.push({
+        name: room.name,
+        x: rx,
+        y: curY,
+        width: rw,
+        height: rh,
+        label: room.name
+      })
+
+      curY += rh
+    })
+  })
+
+  return rooms
+}
 
 
 // ─── COORDINATE SNAPPING ─────────────────────────────────────────────────────
@@ -142,37 +201,33 @@ function computeWalls(rooms, doors) {
   var snap = 0.05
   var rawEdges = []
 
-  rooms.forEach(function(r, ri) {
+  rooms.forEach(function(r) {
     var x1 = r.x, y1 = r.y
     var x2 = r.x + r.width, y2 = r.y + r.height
-    // h = horizontal (y=pos, from x=a to x=b)
-    rawEdges.push({ a: x1, b: x2, pos: y1, axis: 'h', ri: ri })
-    rawEdges.push({ a: x1, b: x2, pos: y2, axis: 'h', ri: ri })
-    // v = vertical (x=pos, from y=a to y=b)
-    rawEdges.push({ a: y1, b: y2, pos: x1, axis: 'v', ri: ri })
-    rawEdges.push({ a: y1, b: y2, pos: x2, axis: 'v', ri: ri })
+    rawEdges.push({ a: x1, b: x2, pos: y1, axis: 'h' })
+    rawEdges.push({ a: x1, b: x2, pos: y2, axis: 'h' })
+    rawEdges.push({ a: y1, b: y2, pos: x1, axis: 'v' })
+    rawEdges.push({ a: y1, b: y2, pos: x2, axis: 'v' })
   })
 
-  // Group edges by axis + snapped position
+  // Group by axis + snapped position
   var groups = {}
   rawEdges.forEach(function(e) {
-    var roundedPos = Math.round(e.pos / snap) * snap
-    var key = e.axis + '_' + roundedPos.toFixed(4)
+    var rp = Math.round(e.pos / snap) * snap
+    var key = e.axis + '_' + rp.toFixed(4)
     if (!groups[key]) {
       groups[key] = { axis: e.axis, pos: e.pos, segments: [], count: 0 }
     }
-    // Running average for position
     groups[key].count++
     groups[key].pos = groups[key].pos + (e.pos - groups[key].pos) / groups[key].count
     groups[key].segments.push({ a: Math.min(e.a, e.b), b: Math.max(e.a, e.b) })
   })
 
-  // Merge overlapping segments at each position
+  // Merge overlapping segments
   var wallSegments = []
   Object.keys(groups).forEach(function(key) {
     var group = groups[key]
     var segs = group.segments.sort(function(a, b) { return a.a - b.a })
-
     var merged = []
     var cur = { a: segs[0].a, b: segs[0].b }
     for (var i = 1; i < segs.length; i++) {
@@ -184,7 +239,6 @@ function computeWalls(rooms, doors) {
       }
     }
     merged.push({ a: cur.a, b: cur.b })
-
     merged.forEach(function(seg) {
       wallSegments.push({ axis: group.axis, pos: group.pos, a: seg.a, b: seg.b })
     })
@@ -195,7 +249,7 @@ function computeWalls(rooms, doors) {
   wallSegments.forEach(function(wall) {
     var segments = [{ a: wall.a, b: wall.b }]
 
-    doors.forEach(function(door) {
+    ;(doors || []).forEach(function(door) {
       var ds = getDoorSegment(door, rooms, snap)
       if (!ds) return
       if (wall.axis !== ds.axis) return
@@ -223,30 +277,22 @@ function computeWalls(rooms, doors) {
   return finalWalls
 }
 
-
-function getDoorSegment(door, rooms, snap) {
+function getDoorSegment(door, rooms) {
   var room1 = rooms.find(function(r) { return r.name === door.room1 })
   if (!room1) return null
-
   var pos = door.position != null ? door.position : 0.5
   var dw = door.width || 0.82
   var wallPos, wallStart, wallEnd, axis
 
   if (door.wall === 'top') {
-    axis = 'h'; wallPos = room1.y
-    wallStart = room1.x; wallEnd = room1.x + room1.width
+    axis = 'h'; wallPos = room1.y; wallStart = room1.x; wallEnd = room1.x + room1.width
   } else if (door.wall === 'bottom') {
-    axis = 'h'; wallPos = room1.y + room1.height
-    wallStart = room1.x; wallEnd = room1.x + room1.width
+    axis = 'h'; wallPos = room1.y + room1.height; wallStart = room1.x; wallEnd = room1.x + room1.width
   } else if (door.wall === 'left') {
-    axis = 'v'; wallPos = room1.x
-    wallStart = room1.y; wallEnd = room1.y + room1.height
+    axis = 'v'; wallPos = room1.x; wallStart = room1.y; wallEnd = room1.y + room1.height
   } else if (door.wall === 'right') {
-    axis = 'v'; wallPos = room1.x + room1.width
-    wallStart = room1.y; wallEnd = room1.y + room1.height
-  } else {
-    return null
-  }
+    axis = 'v'; wallPos = room1.x + room1.width; wallStart = room1.y; wallEnd = room1.y + room1.height
+  } else { return null }
 
   var wallLen = wallEnd - wallStart
   var doorCenter = wallStart + wallLen * pos
@@ -254,7 +300,7 @@ function getDoorSegment(door, rooms, snap) {
 }
 
 
-// ─── DOOR ARC DRAWING ────────────────────────────────────────────────────────
+// ─── DOOR ARC ────────────────────────────────────────────────────────────────
 function drawDoorArc(ctx, door, rooms, X, Y, S) {
   var room1 = rooms.find(function(r) { return r.name === door.room1 })
   if (!room1) return
@@ -262,75 +308,63 @@ function drawDoorArc(ctx, door, rooms, X, Y, S) {
   var pos = door.position != null ? door.position : 0.5
   var dw = door.width || 0.82
   var dwPx = S(dw)
-  var swingInto2 = door.swing !== 'into_room1'
+  var hinge = door.hinge || 'left'
 
   var pivotX, pivotY, startAngle, endAngle
 
   if (door.wall === 'bottom') {
-    var wallY = room1.y + room1.height
-    var doorCenter = room1.x + room1.width * pos
-    var doorLeft = doorCenter - dw / 2
-    var doorRight = doorCenter + dw / 2
-    if (swingInto2) {
-      pivotX = X(doorLeft); pivotY = Y(wallY)
-      startAngle = -Math.PI / 2; endAngle = 0
+    var wy = room1.y + room1.height
+    var dc = room1.x + room1.width * pos
+    if (hinge === 'left') {
+      pivotX = X(dc - dw/2); pivotY = Y(wy)
+      startAngle = -Math.PI/2; endAngle = 0
     } else {
-      pivotX = X(doorRight); pivotY = Y(wallY)
+      pivotX = X(dc + dw/2); pivotY = Y(wy)
       startAngle = Math.PI; endAngle = Math.PI * 1.5
     }
   } else if (door.wall === 'top') {
-    var wallY2 = room1.y
-    var doorCenter2 = room1.x + room1.width * pos
-    var doorLeft2 = doorCenter2 - dw / 2
-    var doorRight2 = doorCenter2 + dw / 2
-    if (swingInto2) {
-      pivotX = X(doorRight2); pivotY = Y(wallY2)
-      startAngle = Math.PI / 2; endAngle = Math.PI
+    var wy2 = room1.y
+    var dc2 = room1.x + room1.width * pos
+    if (hinge === 'left') {
+      pivotX = X(dc2 - dw/2); pivotY = Y(wy2)
+      startAngle = 0; endAngle = Math.PI/2
     } else {
-      pivotX = X(doorLeft2); pivotY = Y(wallY2)
-      startAngle = 0; endAngle = Math.PI / 2
+      pivotX = X(dc2 + dw/2); pivotY = Y(wy2)
+      startAngle = Math.PI/2; endAngle = Math.PI
     }
   } else if (door.wall === 'right') {
-    var wallX = room1.x + room1.width
-    var doorCenter3 = room1.y + room1.height * pos
-    var doorTop = doorCenter3 - dw / 2
-    var doorBottom = doorCenter3 + dw / 2
-    if (swingInto2) {
-      pivotX = X(wallX); pivotY = Y(doorTop)
-      startAngle = Math.PI / 2; endAngle = Math.PI
+    var wx = room1.x + room1.width
+    var dc3 = room1.y + room1.height * pos
+    if (hinge === 'left') {
+      pivotX = X(wx); pivotY = Y(dc3 - dw/2)
+      startAngle = Math.PI/2; endAngle = Math.PI
     } else {
-      pivotX = X(wallX); pivotY = Y(doorBottom)
+      pivotX = X(wx); pivotY = Y(dc3 + dw/2)
       startAngle = Math.PI; endAngle = Math.PI * 1.5
     }
   } else if (door.wall === 'left') {
-    var wallX2 = room1.x
-    var doorCenter4 = room1.y + room1.height * pos
-    var doorTop2 = doorCenter4 - dw / 2
-    var doorBottom2 = doorCenter4 + dw / 2
-    if (swingInto2) {
-      pivotX = X(wallX2); pivotY = Y(doorBottom2)
-      startAngle = -Math.PI / 2; endAngle = 0
+    var wx2 = room1.x
+    var dc4 = room1.y + room1.height * pos
+    if (hinge === 'left') {
+      pivotX = X(wx2); pivotY = Y(dc4 - dw/2)
+      startAngle = -Math.PI/2; endAngle = 0
     } else {
-      pivotX = X(wallX2); pivotY = Y(doorTop2)
-      startAngle = 0; endAngle = Math.PI / 2
+      pivotX = X(wx2); pivotY = Y(dc4 + dw/2)
+      startAngle = 0; endAngle = Math.PI/2
     }
-  } else {
-    return
-  }
+  } else { return }
 
   ctx.strokeStyle = '#4B5563'
   ctx.lineWidth = 1.2
   ctx.setLineDash([])
+
   ctx.beginPath()
   ctx.arc(pivotX, pivotY, dwPx, startAngle, endAngle, false)
   ctx.stroke()
 
   ctx.beginPath()
   ctx.moveTo(pivotX, pivotY)
-  ctx.lineTo(
-    pivotX + dwPx * Math.cos(endAngle),
-    pivotY + dwPx * Math.sin(endAngle)
-  )
+  ctx.lineTo(pivotX + dwPx * Math.cos(endAngle), pivotY + dwPx * Math.sin(endAngle))
   ctx.stroke()
 }
 
@@ -346,21 +380,21 @@ export default function FloorPlanAnalyzer() {
   const canvasRef = useRef(null)
   const fileRef = useRef(null)
 
-  const handleFile = useCallback((file) => {
+  const handleFile = useCallback(function(file) {
     if (!file || !file.type || !file.type.startsWith('image/')) return
     setError(null)
     setAnalysis(null)
 
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      const img = new Image()
-      img.onload = () => {
-        const scale = img.width > MAX_IMG_WIDTH ? MAX_IMG_WIDTH / img.width : 1
-        const c = document.createElement('canvas')
+    var reader = new FileReader()
+    reader.onload = function(e) {
+      var img = new Image()
+      img.onload = function() {
+        var scale = img.width > MAX_IMG_WIDTH ? MAX_IMG_WIDTH / img.width : 1
+        var c = document.createElement('canvas')
         c.width = img.width * scale
         c.height = img.height * scale
         c.getContext('2d').drawImage(img, 0, 0, c.width, c.height)
-        const dataUrl = c.toDataURL('image/jpeg', 0.85)
+        var dataUrl = c.toDataURL('image/jpeg', 0.85)
         setImage(dataUrl)
         setImageData(dataUrl.split(',')[1])
       }
@@ -369,23 +403,23 @@ export default function FloorPlanAnalyzer() {
     reader.readAsDataURL(file)
   }, [])
 
-  const onDrop = useCallback((e) => {
+  const onDrop = useCallback(function(e) {
     e.preventDefault()
     e.currentTarget.classList.remove('drag')
     handleFile(e.dataTransfer.files[0])
   }, [handleFile])
 
-  const analyze = async () => {
+  const analyze = async function() {
     if (!imageData) return
     setLoading(true)
     setError(null)
     setAnalysis(null)
 
     try {
-      const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
+      var apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY
       if (!apiKey) throw new Error('Set VITE_ANTHROPIC_API_KEY in environment')
 
-      const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      var resp = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -407,11 +441,11 @@ export default function FloorPlanAnalyzer() {
       })
 
       if (!resp.ok) {
-        const errData = await resp.json().catch(function() { return {} })
+        var errData = await resp.json().catch(function() { return {} })
         throw new Error((errData.error && errData.error.message) || ('API error ' + resp.status))
       }
 
-      const data = await resp.json()
+      var data = await resp.json()
       var text = ''
       if (data.content) {
         data.content.forEach(function(b) { text += (b.text || '') })
@@ -419,12 +453,20 @@ export default function FloorPlanAnalyzer() {
       var clean = text.replace(/```json/g, '').replace(/```/g, '').trim()
       var parsed = JSON.parse(clean)
 
-      if (!parsed.rooms || parsed.rooms.length === 0) throw new Error('No rooms found')
+      // Convert column layout to room rectangles
+      var rooms = []
+      if (parsed.columns) {
+        rooms = columnsToRooms(parsed)
+      } else if (parsed.rooms) {
+        rooms = parsed.rooms
+      }
 
-      // POST-PROCESS: Snap coordinates to eliminate gaps
-      parsed.rooms = snapRoomCoordinates(parsed.rooms)
+      if (rooms.length === 0) throw new Error('No rooms found')
 
-      setAnalysis(parsed)
+      // Snap coordinates
+      rooms = snapRoomCoordinates(rooms)
+
+      setAnalysis({ rooms: rooms, doors: parsed.doors || [], raw: parsed })
     } catch (err) {
       setError(err.message)
     } finally {
@@ -432,18 +474,18 @@ export default function FloorPlanAnalyzer() {
     }
   }
 
-  useEffect(() => {
+  useEffect(function() {
     if (analysis && analysis.rooms && analysis.rooms.length > 0) {
       drawFloorPlan()
     }
   }, [analysis])
 
-  const drawFloorPlan = () => {
-    const canvas = canvasRef.current
+  const drawFloorPlan = function() {
+    var canvas = canvasRef.current
     if (!canvas || !analysis) return
 
-    const rooms = analysis.rooms || []
-    const doors = analysis.doors || []
+    var rooms = analysis.rooms || []
+    var doors = analysis.doors || []
     if (rooms.length === 0) return
 
     // Bounding box
@@ -459,11 +501,7 @@ export default function FloorPlanAnalyzer() {
     var totalH = maxY - minY
 
     var PAD = 70
-    var PX_PER_M = Math.min(
-      (850 - PAD * 2) / totalW,
-      (750 - PAD * 2) / totalH,
-      100
-    )
+    var PX_PER_M = Math.min((850 - PAD*2) / totalW, (750 - PAD*2) / totalH, 100)
 
     var cw = totalW * PX_PER_M + PAD * 2
     var ch = totalH * PX_PER_M + PAD * 2
@@ -490,12 +528,10 @@ export default function FloorPlanAnalyzer() {
       ctx.fillRect(Xfn(r.x), Yfn(r.y), Sfn(r.width), Sfn(r.height))
     })
 
-    // Compute and draw walls — ALL walls same thickness
+    // Walls — ALL thick
     var walls = computeWalls(rooms, doors)
-    var WALL_THICKNESS = 4
-
     ctx.strokeStyle = '#1a1a1a'
-    ctx.lineWidth = WALL_THICKNESS
+    ctx.lineWidth = 4
     ctx.lineCap = 'square'
 
     walls.forEach(function(w) {
@@ -510,7 +546,7 @@ export default function FloorPlanAnalyzer() {
       ctx.stroke()
     })
 
-    // Draw door arcs
+    // Door arcs
     doors.forEach(function(door) {
       drawDoorArc(ctx, door, rooms, Xfn, Yfn, Sfn)
     })
@@ -519,7 +555,7 @@ export default function FloorPlanAnalyzer() {
     rooms.forEach(function(r) {
       var cx = Xfn(r.x + r.width / 2)
       var cy = Yfn(r.y + r.height / 2)
-      var fs = Math.max(10, Math.min(14, Sfn(Math.min(r.width, r.height)) / 6))
+      var fs = Math.max(9, Math.min(14, Sfn(Math.min(r.width, r.height)) / 6))
 
       ctx.textAlign = 'center'
       ctx.textBaseline = 'middle'
@@ -529,22 +565,21 @@ export default function FloorPlanAnalyzer() {
 
       ctx.fillStyle = '#6b7280'
       ctx.font = '400 ' + (fs * 0.85) + 'px "Segoe UI", system-ui, sans-serif'
-      var dimText = r.label || (r.width.toFixed(1) + ' x ' + r.height.toFixed(1))
+      var dimText = r.width.toFixed(1) + ' x ' + r.height.toFixed(1)
       ctx.fillText(dimText, cx, cy + fs * 0.5)
     })
 
     // Dimension lines
     drawDimensions(ctx, rooms, Xfn, Yfn, Sfn, PAD, minX, minY, maxX, maxY)
 
-    // North arrow
     ctx.fillStyle = '#9ca3af'
     ctx.font = '11px sans-serif'
     ctx.textAlign = 'right'
     ctx.textBaseline = 'top'
-    ctx.fillText('N ↑', cw - 8, 8)
+    ctx.fillText('N \u2191', cw - 8, 8)
   }
 
-  const drawDimensions = (ctx, rooms, X, Y, S, PAD, minX, minY, maxX, maxY) => {
+  const drawDimensions = function(ctx, rooms, X, Y, S, PAD, minX, minY, maxX, maxY) {
     var TICK = 6, OFFSET = 25
     ctx.strokeStyle = '#6b7280'
     ctx.fillStyle = '#4b5563'
@@ -583,24 +618,17 @@ export default function FloorPlanAnalyzer() {
       ctx.restore()
     }
 
-    // Overall
     dimH(X(minX), X(maxX), Y(minY), (maxX - minX).toFixed(2) + 'm', true)
     dimV(Y(minY), Y(maxY), X(minX), (maxY - minY).toFixed(2) + 'm', true)
 
-    // Per-room on right edge
-    var rightRooms = rooms
-      .filter(function(r) { return Math.abs((r.x + r.width) - maxX) < 0.15 })
-      .sort(function(a, b) { return a.y - b.y })
+    var rightRooms = rooms.filter(function(r) { return Math.abs((r.x + r.width) - maxX) < 0.15 }).sort(function(a, b) { return a.y - b.y })
     if (rightRooms.length > 1) {
       rightRooms.forEach(function(r) {
         dimV(Y(r.y), Y(r.y + r.height), X(maxX), r.height.toFixed(1) + 'm', false)
       })
     }
 
-    // Per-room on bottom edge
-    var bottomRooms = rooms
-      .filter(function(r) { return Math.abs((r.y + r.height) - maxY) < 0.15 })
-      .sort(function(a, b) { return a.x - b.x })
+    var bottomRooms = rooms.filter(function(r) { return Math.abs((r.y + r.height) - maxY) < 0.15 }).sort(function(a, b) { return a.x - b.x })
     if (bottomRooms.length > 1) {
       bottomRooms.forEach(function(r) {
         dimH(X(r.x), X(r.x + r.width), Y(maxY), r.width.toFixed(1) + 'm', false)
@@ -617,16 +645,14 @@ export default function FloorPlanAnalyzer() {
       </header>
 
       {!image && (
-        <div
-          className="fpa-upload"
-          onClick={() => fileRef.current && fileRef.current.click()}
+        <div className="fpa-upload"
+          onClick={function() { fileRef.current && fileRef.current.click() }}
           onDrop={onDrop}
-          onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('drag') }}
-          onDragLeave={(e) => e.currentTarget.classList.remove('drag')}
-        >
+          onDragOver={function(e) { e.preventDefault(); e.currentTarget.classList.add('drag') }}
+          onDragLeave={function(e) { e.currentTarget.classList.remove('drag') }}>
           <input ref={fileRef} type="file" accept="image/*"
-            onChange={(e) => handleFile(e.target.files[0])} />
-          <span className="fpa-upload-icon">📐</span>
+            onChange={function(e) { handleFile(e.target.files[0]) }} />
+          <span className="fpa-upload-icon">&#x1F4D0;</span>
           <span className="fpa-upload-text">Drop floor plan image or click to browse</span>
         </div>
       )}
@@ -635,14 +661,11 @@ export default function FloorPlanAnalyzer() {
         <div className="fpa-controls">
           <img src={image} alt="Floor plan" className="fpa-preview" />
           <div className="fpa-buttons">
-            <button onClick={analyze} disabled={loading}
-              className="fpa-btn fpa-btn-primary">
+            <button onClick={analyze} disabled={loading} className="fpa-btn fpa-btn-primary">
               {loading ? 'Analyzing\u2026' : 'Analyze Floor Plan'}
             </button>
-            <button onClick={() => { setImage(null); setImageData(null); setAnalysis(null); setError(null) }}
-              className="fpa-btn fpa-btn-secondary">
-              Clear
-            </button>
+            <button onClick={function() { setImage(null); setImageData(null); setAnalysis(null); setError(null) }}
+              className="fpa-btn fpa-btn-secondary">Clear</button>
           </div>
         </div>
       )}
@@ -668,28 +691,20 @@ export default function FloorPlanAnalyzer() {
           <div className="fpa-canvas-wrap">
             <canvas ref={canvasRef} className="fpa-canvas" />
           </div>
-
           <details className="fpa-details">
             <summary>Room Details</summary>
             <table className="fpa-table">
-              <thead>
-                <tr><th>Room</th><th>Position (x, y)</th><th>Size (w &times; h)</th></tr>
-              </thead>
+              <thead><tr><th>Room</th><th>Position</th><th>Size</th></tr></thead>
               <tbody>
-                {analysis.rooms.map((r, i) => (
-                  <tr key={i}>
-                    <td>{r.name}</td>
-                    <td>{r.x.toFixed(2)}, {r.y.toFixed(2)}</td>
-                    <td>{r.width.toFixed(2)} &times; {r.height.toFixed(2)} m</td>
-                  </tr>
-                ))}
+                {analysis.rooms.map(function(r, i) {
+                  return <tr key={i}><td>{r.name}</td><td>{r.x.toFixed(2)}, {r.y.toFixed(2)}</td><td>{r.width.toFixed(2)} &times; {r.height.toFixed(2)}m</td></tr>
+                })}
               </tbody>
             </table>
           </details>
-
           <details className="fpa-details">
             <summary>Raw AI Response</summary>
-            <pre className="fpa-json">{JSON.stringify(analysis, null, 2)}</pre>
+            <pre className="fpa-json">{JSON.stringify(analysis.raw || analysis, null, 2)}</pre>
           </details>
         </div>
       )}
