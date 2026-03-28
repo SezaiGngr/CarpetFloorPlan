@@ -28,74 +28,110 @@ Return ONLY valid JSON.`
 function detectWalls(imageData, width, height) {
   var data = imageData.data
   var DARK = 100
-  var MIN_LEN = 12
-  var MIN_THICK = 2
+  var MIN_LEN = 15
+  var MIN_THICK = 3
   var MAX_GAP = 4
 
+  // Build dark pixel mask
   var mask = new Uint8Array(width * height)
   for (var i = 0; i < width * height; i++) {
     var r = data[i * 4], g = data[i * 4 + 1], b = data[i * 4 + 2], a = data[i * 4 + 3]
     if (a > 100 && r < DARK && g < DARK && b < DARK) mask[i] = 1
   }
 
-  // Horizontal segments
+  // ── Horizontal: scan rows, but SKIP rows too close to already-found walls ──
   var hSegs = []
+  var lastHWallY = -999  // track last wall y to skip duplicates
+
   for (var y = 0; y < height; y++) {
+    // Skip if too close to a wall we already found
+    if (y - lastHWallY < 8) continue
+
     var runStart = -1, gap = 0
+    var foundAny = false
+
     for (var x = 0; x < width; x++) {
+      // Check vertical thickness at this point
       var thick = 0
-      for (var dy = -3; dy <= 3; dy++) {
+      for (var dy = -4; dy <= 4; dy++) {
         var ny = y + dy
         if (ny >= 0 && ny < height && mask[ny * width + x]) thick++
       }
-      if (thick >= MIN_THICK) {
+      var isWall = thick >= MIN_THICK
+
+      if (isWall) {
         if (runStart === -1) runStart = x
         gap = 0
       } else if (runStart !== -1) {
         gap++
         if (gap > MAX_GAP) {
           var end = x - gap
-          if (end - runStart >= MIN_LEN) hSegs.push({ x1: runStart, y1: y, x2: end, y2: y })
+          if (end - runStart >= MIN_LEN) {
+            hSegs.push({ x1: runStart, y1: y, x2: end, y2: y })
+            foundAny = true
+          }
           runStart = -1; gap = 0
         }
       }
     }
     if (runStart !== -1) {
       var endX = width - 1 - gap
-      if (endX - runStart >= MIN_LEN) hSegs.push({ x1: runStart, y1: y, x2: endX, y2: y })
+      if (endX - runStart >= MIN_LEN) {
+        hSegs.push({ x1: runStart, y1: y, x2: endX, y2: y })
+        foundAny = true
+      }
     }
+
+    if (foundAny) lastHWallY = y
   }
 
-  // Vertical segments
+  // ── Vertical: scan columns, skip columns too close to already-found walls ──
   var vSegs = []
+  var lastVWallX = -999
+
   for (var x2 = 0; x2 < width; x2++) {
+    if (x2 - lastVWallX < 8) continue
+
     var runStart2 = -1, gap2 = 0
+    var foundAny2 = false
+
     for (var y2 = 0; y2 < height; y2++) {
       var thick2 = 0
-      for (var dx = -3; dx <= 3; dx++) {
+      for (var dx = -4; dx <= 4; dx++) {
         var nx = x2 + dx
         if (nx >= 0 && nx < width && mask[y2 * width + nx]) thick2++
       }
-      if (thick2 >= MIN_THICK) {
+      var isWall2 = thick2 >= MIN_THICK
+
+      if (isWall2) {
         if (runStart2 === -1) runStart2 = y2
         gap2 = 0
       } else if (runStart2 !== -1) {
         gap2++
         if (gap2 > MAX_GAP) {
           var end2 = y2 - gap2
-          if (end2 - runStart2 >= MIN_LEN) vSegs.push({ x1: x2, y1: runStart2, x2: x2, y2: end2 })
+          if (end2 - runStart2 >= MIN_LEN) {
+            vSegs.push({ x1: x2, y1: runStart2, x2: x2, y2: end2 })
+            foundAny2 = true
+          }
           runStart2 = -1; gap2 = 0
         }
       }
     }
     if (runStart2 !== -1) {
       var endY = height - 1 - gap2
-      if (endY - runStart2 >= MIN_LEN) vSegs.push({ x1: x2, y1: runStart2, x2: x2, y2: endY })
+      if (endY - runStart2 >= MIN_LEN) {
+        vSegs.push({ x1: x2, y1: runStart2, x2: x2, y2: endY })
+        foundAny2 = true
+      }
     }
+
+    if (foundAny2) lastVWallX = x2
   }
 
-  var mergedH = mergeSegments(hSegs, 'h', 6)
-  var mergedV = mergeSegments(vSegs, 'v', 6)
+  // Merge remaining nearby duplicates
+  var mergedH = mergeSegments(hSegs, 'h', 10)
+  var mergedV = mergeSegments(vSegs, 'v', 10)
 
   return { horizontal: mergedH, vertical: mergedV }
 }
@@ -322,8 +358,8 @@ export default function FloorPlanAnalyzer() {
       ctx.stroke()
     })
 
-    // Dimension labels on every wall segment
-    var MIN_LABEL_PX = 30
+    // Dimension labels on walls
+    var MIN_LABEL_PX = 35
     ctx.fillStyle = '#2563eb'
 
     allWalls.forEach(function(w) {
@@ -353,7 +389,6 @@ export default function FloorPlanAnalyzer() {
       }
     })
 
-    // North arrow
     ctx.fillStyle = '#9ca3af'
     ctx.font = '11px sans-serif'
     ctx.textAlign = 'right'
