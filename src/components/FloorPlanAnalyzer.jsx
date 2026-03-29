@@ -227,6 +227,7 @@ function mergeSegments(segs, axis, tol) {
 function joinCollinear(walls, axis, posTol) {
   if (walls.length < 2) return walls
 
+  // Sort by position then by start coordinate
   var sorted = walls.slice().sort(function(a, b) {
     return axis === 'h' ? a.y1 - b.y1 || a.x1 - b.x1 : a.x1 - b.x1 || a.y1 - b.y1
   })
@@ -240,8 +241,18 @@ function joinCollinear(walls, axis, posTol) {
       ? Math.abs(s.y1 - cur.y1) <= posTol
       : Math.abs(s.x1 - cur.x1) <= posTol
 
+    // Also check: segments must overlap or have a gap smaller than 50px
+    // This prevents merging two separate walls at similar Y but far apart on X
+    var closeEnough = false
     if (samePos) {
-      // Same line — merge regardless of gap
+      if (axis === 'h') {
+        closeEnough = s.x1 <= cur.x2 + 50
+      } else {
+        closeEnough = s.y1 <= cur.y2 + 50
+      }
+    }
+
+    if (samePos && closeEnough) {
       if (axis === 'h') {
         cur.x1 = Math.min(cur.x1, s.x1)
         cur.x2 = Math.max(cur.x2, s.x2)
