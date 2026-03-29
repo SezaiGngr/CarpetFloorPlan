@@ -144,7 +144,7 @@ function detectWalls(imageData, width, height) {
     if (found2) lastVX = vx
   }
 
-  // Step 6: Merge nearby parallel segments
+  // Step 6: Merge nearby parallel segments (tight pass)
   var mH = mergeSegments(hSegs, 'h', MERGE_TOL)
   var mV = mergeSegments(vSegs, 'v', MERGE_TOL)
 
@@ -158,6 +158,12 @@ function detectWalls(imageData, width, height) {
   // Step 8: Connection filter — one end must touch a perpendicular wall
   mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL)
   mV = filterOneEnd(mV, mH, 'v', CONNECT_TOL)
+
+  // Step 9: Join collinear segments that were split at intersections
+  // Two segments at the same position with a gap are likely the same wall
+  // split where a perpendicular wall crosses. Rejoin them.
+  mH = joinCollinear(mH, 'h', MERGE_TOL)
+  mV = joinCollinear(mV, 'v', MERGE_TOL)
 
   return { horizontal: mH, vertical: mV }
 }
@@ -212,6 +218,48 @@ function mergeSegments(segs, axis, tol) {
     } else { m.push(c); c = {x1: si.x1, y1: si.y1, x2: si.x2, y2: si.y2} }
   }
   m.push(c); return m
+}
+
+
+// Join segments that are on the same line (same y for H, same x for V)
+// regardless of gap size. After filtering, any surviving segments at the
+// same position are real walls that should be one continuous line.
+function joinCollinear(walls, axis, posTol) {
+  if (walls.length < 2) return walls
+
+  var sorted = walls.slice().sort(function(a, b) {
+    return axis === 'h' ? a.y1 - b.y1 || a.x1 - b.x1 : a.x1 - b.x1 || a.y1 - b.y1
+  })
+
+  var result = []
+  var cur = {x1: sorted[0].x1, y1: sorted[0].y1, x2: sorted[0].x2, y2: sorted[0].y2}
+
+  for (var i = 1; i < sorted.length; i++) {
+    var s = sorted[i]
+    var samePos = axis === 'h'
+      ? Math.abs(s.y1 - cur.y1) <= posTol
+      : Math.abs(s.x1 - cur.x1) <= posTol
+
+    if (samePos) {
+      // Same line — merge regardless of gap
+      if (axis === 'h') {
+        cur.x1 = Math.min(cur.x1, s.x1)
+        cur.x2 = Math.max(cur.x2, s.x2)
+        cur.y1 = Math.round((cur.y1 + s.y1) / 2)
+        cur.y2 = cur.y1
+      } else {
+        cur.y1 = Math.min(cur.y1, s.y1)
+        cur.y2 = Math.max(cur.y2, s.y2)
+        cur.x1 = Math.round((cur.x1 + s.x1) / 2)
+        cur.x2 = cur.x1
+      }
+    } else {
+      result.push(cur)
+      cur = {x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2}
+    }
+  }
+  result.push(cur)
+  return result
 }
 
 
