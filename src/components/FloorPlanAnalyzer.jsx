@@ -109,6 +109,11 @@ function detectWalls(imageData, width, height) {
   mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL)
   mV = filterOneEnd(mV, mH, 'v', CONNECT_TOL)
 
+  // Step 8b: Solidity filter — remove segments where < 60% of pixels are thick
+  // Real walls are solid continuous bands. Text has gaps between characters.
+  mH = filterBySolidity(mH, vThick, width, MIN_THICK, 0.6, 'h')
+  mV = filterBySolidity(mV, hThick, width, MIN_THICK, 0.6, 'v')
+
   // Step 9: Detect doors BEFORE joining — gaps still exist at this point
   var doors = detectDoors(mH, mV, mask, width, height, env)
 
@@ -123,8 +128,6 @@ function detectWalls(imageData, width, height) {
   }
 
   // Step 12: Remove near-duplicate parallel walls
-  // If two walls are very close (< 20px apart) and overlap significantly,
-  // keep only the longer one. This removes false walls from stair/bath fixtures.
   mH = removeNearbyDuplicates(mH, 'h', 20)
   mV = removeNearbyDuplicates(mV, 'v', 20)
 
@@ -279,6 +282,31 @@ function filterOneEnd(walls, cross, axis, tol) {
       }
     })
     return connected
+  })
+}
+
+// Check what % of pixels along a wall are actually thick (solid wall vs text)
+// Real wall: 70-100% of pixels are thick. Text: 20-50% (gaps between characters).
+function filterBySolidity(walls, thickMap, imgWidth, minThick, minSolidity, axis) {
+  return walls.filter(function(w) {
+    var thickCount = 0, totalCount = 0
+
+    if (axis === 'h') {
+      var y = w.y1
+      for (var x = w.x1; x <= w.x2; x += 2) {
+        totalCount++
+        if (y >= 0 && y * imgWidth + x < thickMap.length && thickMap[y * imgWidth + x] >= minThick) thickCount++
+      }
+    } else {
+      var x = w.x1
+      for (var y2 = w.y1; y2 <= w.y2; y2 += 2) {
+        totalCount++
+        if (y2 * imgWidth + x >= 0 && y2 * imgWidth + x < thickMap.length && thickMap[y2 * imgWidth + x] >= minThick) thickCount++
+      }
+    }
+
+    if (totalCount === 0) return false
+    return (thickCount / totalCount) >= minSolidity
   })
 }
 
