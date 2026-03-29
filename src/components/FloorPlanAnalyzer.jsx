@@ -35,7 +35,7 @@ function detectWalls(imageData, width, height) {
   var MAX_GAP = 6
   var ROW_SKIP = 7
   var MERGE_TOL = 10
-  var CONNECT_TOL = 25
+  var CONNECT_TOL = 15
 
   // Step 1: Dark pixel mask
   var mask = new Uint8Array(width * height)
@@ -241,14 +241,14 @@ function joinCollinear(walls, axis, posTol) {
       ? Math.abs(s.y1 - cur.y1) <= posTol
       : Math.abs(s.x1 - cur.x1) <= posTol
 
-    // Also check: segments must overlap or have a gap smaller than 50px
+    // Also check: segments must overlap or have a gap smaller than 25px
     // This prevents merging two separate walls at similar Y but far apart on X
     var closeEnough = false
     if (samePos) {
       if (axis === 'h') {
-        closeEnough = s.x1 <= cur.x2 + 50
+        closeEnough = s.x1 <= cur.x2 + 25
       } else {
-        closeEnough = s.y1 <= cur.y2 + 50
+        closeEnough = s.y1 <= cur.y2 + 25
       }
     }
 
