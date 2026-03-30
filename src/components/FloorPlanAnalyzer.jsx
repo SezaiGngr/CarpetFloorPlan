@@ -6,114 +6,112 @@ const MODEL = 'claude-sonnet-4-20250514'
 
 function buildPrompt(pixelContext) {
   var shapeHint = ''
-  if (pixelContext && pixelContext.outline) {
-    var o = pixelContext.outline
-    shapeHint = '\nIMPORTANT — PIXEL PRE-ANALYSIS RESULTS:\n' +
-      'Automated pixel analysis detected the following structural features.\n' +
-      'Use these as HINTS to guide your analysis.\n\n' +
-      'Building shape: ' + o.description + '\n'
-    if (o.shape !== 'rectangular') {
-      shapeHint += '\nWARNING: This building is NOT rectangular. The exterior walls do NOT form a simple box.\n' +
-        'You MUST trace the actual perimeter — do NOT assume 4 straight walls.\n' +
-        'Look for step-ins, setbacks, or notches in the building footprint.\n'
-    }
-    if (pixelContext.gapClassifications && pixelContext.gapClassifications.length > 0) {
-      shapeHint += '\nDetected boundary gaps:\n'
-      pixelContext.gapClassifications.forEach(function(g) {
-        shapeHint += '  - ' + g.boundary + ' wall: ' + g.type + ' gap (' + g.gapSize + 'px wide)\n'
-      })
-      shapeHint += 'Note: "window" = thin parallel lines (glass). "twall" = perpendicular wall junction. "open" = building shape feature.\n'
-    }
+  if (pixelContext && pixelContext.outline && pixelContext.outline.shape !== 'rectangular' && pixelContext.outline.shape !== 'unknown') {
+    shapeHint = '\n\nPIXEL PRE-ANALYSIS HINT:\n' +
+      'Automated analysis suggests this building is ' + pixelContext.outline.shape + '.\n' +
+      pixelContext.outline.description + '\n' +
+      'The exterior walls do NOT form a simple rectangle. Look for step-ins or setbacks in the perimeter.\n' +
+      'WINDOWS have thin parallel lines in wall gaps. T-WALL JUNCTIONS have thick perpendicular walls meeting the exterior.\n'
   }
 
-  return 'You are an expert floor plan analyzer with perfect spatial reasoning.\n\n' +
-    'CRITICAL FIRST STEP — CROP TO ACTUAL FLOOR PLAN:\n' +
+  return 'You are an expert floor plan analyzer with perfect spatial reasoning.\n' +
+    '\nCRITICAL FIRST STEP — CROP TO ACTUAL FLOOR PLAN:\n' +
     'Many floor plan photos have large black or white borders/padding around the actual drawing.\n' +
     'Before measuring ANYTHING, identify the bounding box of the actual floor plan drawing itself.\n' +
-    'ALL pixel coordinates you return must be relative to the TOP-LEFT CORNER OF THE FULL IMAGE.\n' +
+    'ALL pixel coordinates you return must be relative to the TOP-LEFT CORNER OF THE FULL IMAGE (0,0 = top-left pixel of the uploaded image).\n' +
     'Do NOT re-number coordinates after mentally cropping — use full image pixel coordinates throughout.\n' +
     shapeHint +
-    '\nYOUR TASKS:\n\n' +
-    '1. CALIBRATION\n' +
-    '   - Find ALL labeled rooms with written dimensions (e.g. "3.7 x 3.7M", "5.5 x 3.7M")\n' +
-    '   - For EACH labeled room: measure pixel dimensions, compute PPM_x and PPM_y\n' +
-    '   - Use the MEDIAN PPM across all rooms (robust against outliers)\n' +
-    '   - Flag any room deviating >5% from median\n' +
-    '   - If PPM_x and PPM_y differ by <3%, use unified PPM (their average)\n\n' +
-    '2. BUILDING OUTLINE\n' +
-    '   - Trace the ACTUAL exterior perimeter of the building\n' +
-    '   - Do NOT assume a rectangle — many buildings are L-shaped, T-shaped, or U-shaped\n' +
-    '   - At each corner of the perimeter, record the pixel coordinate\n' +
-    '   - DISTINGUISH between:\n' +
-    '     * WINDOWS: gaps in exterior walls with thin parallel lines (glass) — wall CONTINUES past these\n' +
-    '     * T-WALL JUNCTIONS: perpendicular interior wall meets exterior wall — exterior wall CONTINUES\n' +
-    '     * STEP-INS: building footprint actually changes shape — exterior wall STOPS, perimeter turns inward\n' +
-    '   - Report the perimeter as a list of corner points\n\n' +
-    '3. DOOR DETECTION\n' +
-    '   A. SWING DOOR: gap in wall PLUS quarter-circle arc. arc_center = hinge point.\n' +
-    '   B. OPEN PASSAGE: gap with NO arc.\n' +
-    '   C. SLIDING/BIFOLD: gap with parallel lines.\n' +
-    '   D. WINDOW: gap in EXTERIOR wall with double-line sill. NOT a door.\n\n' +
-    '4. WALL MEASUREMENTS\n' +
-    '   - Measure every wall of every room in pixels, convert to meters\n' +
+    '\nYOUR TASKS:\n' +
+    '\n1. CALIBRATION\n' +
+    '   - Find all labeled rooms with written dimensions (e.g. "3x4m", "5 x 6m", "2.8 x 3.6m")\n' +
+    '   - Pick the LARGEST clearly labeled room for best accuracy (more pixels = more precise ratio)\n' +
+    '   - Carefully measure that room\'s SHORT wall in pixels in the full image\n' +
+    '   - pixels_per_meter = short_side_pixels / short_side_label_m\n' +
+    '   - Double-check: does the long side = long_side_label_m x pixels_per_meter? Adjust if not.\n' +
+    '\n2. DOOR DETECTION — distinguish each type carefully:\n' +
+    '   A. SWING DOOR: gap in wall PLUS a quarter-circle arc. Arc pivots from one end of the gap.\n' +
+    '      - arc_center_x/y = the hinge point (one end of the gap, full image coords)\n' +
+    '      - arc_radius_px = gap width in pixels (= door panel length)\n' +
+    '      - arc_start_deg / arc_end_deg = angular sweep (e.g. 0->90, 90->180, 180->270, 270->360)\n' +
+    '      - wall_orientation: "horizontal" if wall runs left-right, "vertical" if wall runs top-bottom\n' +
+    '   B. OPEN PASSAGE: gap in wall with NO arc. Wardrobe entries, open archways.\n' +
+    '   C. SLIDING or BIFOLD: gap with parallel lines. Often balcony/patio access.\n' +
+    '   D. WINDOW: gap in EXTERIOR (outer perimeter) wall with double-line sill. NOT a door.\n' +
+    '\n3. WALL MEASUREMENTS\n' +
+    '   - Measure every wall of every room in pixels, convert to meters using calibration\n' +
     '   - Gaps (doors/windows) are INCLUDED in total wall length\n' +
-    '   - All bounding_box coordinates are full image pixel coordinates\n\n' +
-    'Return ONLY valid JSON — no markdown, no backticks:\n\n' +
-    '{\n' +
+    '   - All bounding_box coordinates are full image pixel coordinates\n' +
+    '\nReturn ONLY valid JSON — no markdown, no backticks, no explanation, nothing before or after the JSON:\n' +
+    '\n{\n' +
     '  "calibration": {\n' +
-    '    "reference_rooms": [\n' +
-    '      { "name": "...", "label": "3.7 x 3.7M", "ppm_x": 56.0, "ppm_y": 55.8 }\n' +
-    '    ],\n' +
-    '    "median_ppm_x": 56.0,\n' +
-    '    "median_ppm_y": 55.8,\n' +
-    '    "unified_ppm": 55.9,\n' +
+    '    "reference_room": "Living",\n' +
+    '    "label_text": "5 x 6m",\n' +
+    '    "short_side_label_m": 5,\n' +
+    '    "long_side_label_m": 6,\n' +
+    '    "short_side_pixels": 280,\n' +
+    '    "long_side_pixels": 336,\n' +
+    '    "pixels_per_meter": 56.0,\n' +
     '    "confidence": "high"\n' +
     '  },\n' +
-    '  "building_outline": {\n' +
-    '    "shape": "L-shaped",\n' +
-    '    "perimeter_corners": [\n' +
-    '      { "x": 60, "y": 40, "label": "top-left" },\n' +
-    '      { "x": 500, "y": 40, "label": "top-right" }\n' +
-    '    ],\n' +
-    '    "notes": "Step-in on bottom-right: right wall stops at y=450"\n' +
+    '  "floorplan_bounds": {\n' +
+    '    "x": 60, "y": 420, "w": 550, "h": 650,\n' +
+    '    "note": "Actual floor plan drawing region in the full image"\n' +
     '  },\n' +
     '  "rooms": [\n' +
     '    {\n' +
-    '      "name": "Bedroom 1",\n' +
-    '      "label": "3.7 x 3.7M",\n' +
-    '      "bounding_box": { "x": 62, "y": 52, "w": 207, "h": 207 },\n' +
+    '      "name": "Living",\n' +
+    '      "label": "5 x 6m",\n' +
+    '      "bounding_box": { "x": 190, "y": 580, "w": 280, "h": 336 },\n' +
     '      "walls": [\n' +
-    '        { "side": "north", "length_px": 207, "length_m": 3.7, "has_door": false, "has_window": false },\n' +
-    '        { "side": "east",  "length_px": 207, "length_m": 3.7, "has_door": false, "has_window": false },\n' +
-    '        { "side": "south", "length_px": 207, "length_m": 3.7, "has_door": true,  "has_window": false },\n' +
-    '        { "side": "west",  "length_px": 207, "length_m": 3.7, "has_door": false, "has_window": false }\n' +
+    '        { "side": "north", "length_px": 280, "length_m": 5.0, "has_door": true,  "has_window": false },\n' +
+    '        { "side": "east",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": false },\n' +
+    '        { "side": "south", "length_px": 280, "length_m": 5.0, "has_door": false, "has_window": false },\n' +
+    '        { "side": "west",  "length_px": 336, "length_m": 6.0, "has_door": false, "has_window": true  }\n' +
     '      ]\n' +
     '    }\n' +
     '  ],\n' +
     '  "doors": [\n' +
     '    {\n' +
-    '      "id": "D1", "type": "swing", "wall_orientation": "horizontal",\n' +
-    '      "location": "Bedroom 1 south wall",\n' +
-    '      "gap_x": 180, "gap_y": 259, "gap_width_px": 52, "gap_width_m": 0.93,\n' +
-    '      "arc_center_x": 180, "arc_center_y": 259, "arc_radius_px": 52,\n' +
-    '      "arc_start_deg": 0, "arc_end_deg": 90,\n' +
-    '      "connects": ["Bedroom 1", "Hallway"]\n' +
+    '      "id": "D1",\n' +
+    '      "type": "swing",\n' +
+    '      "wall_orientation": "horizontal",\n' +
+    '      "location": "Bed 2 south wall into corridor",\n' +
+    '      "gap_x": 120,\n' +
+    '      "gap_y": 490,\n' +
+    '      "gap_width_px": 52,\n' +
+    '      "gap_width_m": 0.93,\n' +
+    '      "arc_center_x": 120,\n' +
+    '      "arc_center_y": 490,\n' +
+    '      "arc_radius_px": 52,\n' +
+    '      "arc_start_deg": 0,\n' +
+    '      "arc_end_deg": 90,\n' +
+    '      "connects": ["Bed 2", "Corridor"]\n' +
     '    }\n' +
     '  ],\n' +
     '  "passages": [\n' +
     '    {\n' +
-    '      "id": "P1", "wall_orientation": "horizontal", "location": "...",\n' +
-    '      "gap_x": 90, "gap_y": 520, "gap_width_px": 40, "gap_width_m": 0.71,\n' +
-    '      "connects": ["...", "..."]\n' +
+    '      "id": "P1",\n' +
+    '      "wall_orientation": "horizontal",\n' +
+    '      "location": "Robe entry from Bed 2",\n' +
+    '      "gap_x": 90,\n' +
+    '      "gap_y": 520,\n' +
+    '      "gap_width_px": 40,\n' +
+    '      "gap_width_m": 0.71,\n' +
+    '      "connects": ["Bed 2", "Robe"]\n' +
     '    }\n' +
     '  ],\n' +
     '  "windows": [\n' +
     '    {\n' +
-    '      "id": "W1", "location": "North exterior wall", "wall_orientation": "horizontal",\n' +
-    '      "center_x": 395, "center_y": 42, "width_px": 60, "width_m": 1.07\n' +
+    '      "id": "W1",\n' +
+    '      "location": "North exterior wall of Bed 1",\n' +
+    '      "wall_orientation": "horizontal",\n' +
+    '      "center_x": 395,\n' +
+    '      "center_y": 418,\n' +
+    '      "width_px": 60,\n' +
+    '      "width_m": 1.07\n' +
     '    }\n' +
     '  ],\n' +
-    '  "summary": "..."\n' +
+    '  "summary": "Calibrated via Living (5x6m = 280x336px = 56px/m). Found 5 swing doors, 3 open passages, 4 windows."\n' +
     '}'
 }
 
@@ -427,9 +425,9 @@ export default function FloorPlanAnalyzer() {
               <div className="fpa-cal-card">
                 <div className="fpa-cal-label">Calibration</div>
                 <div className="fpa-cal-row">
-                  <span className="cal-room">{cal.reference_rooms ? cal.reference_rooms.length+' rooms' : cal.reference_room}</span>
+                  <span className="cal-room">{cal.reference_room || (cal.reference_rooms ? cal.reference_rooms.length+' rooms' : '')}</span>
                   <span className="cal-eq">{cal.label_text || cal.reference_rooms?.[0]?.label}</span>
-                  <span className="cal-px">{(cal.unified_ppm||cal.median_ppm_x||cal.pixels_per_meter)?.toFixed(1)} px/m</span>
+                  <span className="cal-px">{(cal.pixels_per_meter||cal.unified_ppm||cal.median_ppm_x)?.toFixed(1)} px/m</span>
                 </div>
                 <div className={`fpa-cal-conf ${cal.confidence}`}>{cal.confidence} confidence</div>
                 {analysis.building_outline && <div className="fpa-cal-row" style={{marginTop:4,fontSize:11,opacity:0.7}}>Shape: {analysis.building_outline.shape}</div>}
