@@ -109,12 +109,13 @@ function detectWalls(imageData, width, height) {
   mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL)
   mV = filterOneEnd(mV, mH, 'v', CONNECT_TOL)
 
-  // Step 8b: Solidity filter — remove segments where < 60% of pixels are thick
-  // Real walls are solid continuous bands. Text has gaps between characters.
-  mH = filterBySolidity(mH, vThick, width, MIN_THICK, 0.6, 'h')
-  mV = filterBySolidity(mV, hThick, width, MIN_THICK, 0.6, 'v')
+  // Step 8b: Solidity filter — walls must be >= 40% thick pixels
+  // Text characters have gaps, so only ~20-30% of their pixels are thick.
+  // Real walls are 70-100%. Threshold at 40% catches text but keeps walls.
+  mH = filterBySolidity(mH, vThick, width, MIN_THICK, 0.4, 'h')
+  mV = filterBySolidity(mV, hThick, width, MIN_THICK, 0.4, 'v')
 
-  // Step 9: Detect doors BEFORE joining — gaps still exist at this point
+  // Step 9: Detect doors BEFORE joining (gaps still exist)
   var doors = detectDoors(mH, mV, mask, width, height, env)
 
   // Step 10: Join collinear segments (split walls) with max 25px gap
@@ -127,7 +128,7 @@ function detectWalls(imageData, width, height) {
     mV = closeWindowGaps(mV, env, 'v', 15)
   }
 
-  // Step 12: Remove near-duplicate parallel walls
+  // Step 12: Remove near-duplicate parallel walls (< 20px apart, overlapping)
   mH = removeNearbyDuplicates(mH, 'h', 20)
   mV = removeNearbyDuplicates(mV, 'v', 20)
 
@@ -202,7 +203,7 @@ function detectDoors(hWalls, vWalls, mask, imgW, imgH, env) {
   var boundaryTol = 15
 
   // Check gaps in horizontal walls at same Y
-  var hByY = groupByPos(hWalls, 'h', 12)
+  var hByY = groupByPos(hWalls, 'h', 10)
   Object.keys(hByY).forEach(function(key) {
     var segs = hByY[key].sort(function(a,b){return a.x1-b.x1})
     for (var i = 0; i < segs.length - 1; i++) {
@@ -211,23 +212,27 @@ function detectDoors(hWalls, vWalls, mask, imgW, imgH, env) {
       var gapSize = gapEnd - gapStart
       var wallY = segs[i].y1
 
-      // Skip exterior walls (windows handled separately)
+      // Skip if on exterior boundary (those are windows, already closed)
       if (env && (Math.abs(wallY - env.top) < boundaryTol || Math.abs(wallY - env.bottom) < boundaryTol)) continue
 
-      // Door gaps typically 8-70px
-      if (gapSize > 8 && gapSize < 70) {
-        doors.push({
-          x: gapStart, y: wallY,
-          endX: gapEnd, endY: wallY,
-          width: gapSize,
-          orientation: 'horizontal'
-        })
+      // Door gaps are typically 15-60px wide
+      if (gapSize > 10 && gapSize < 80) {
+        // Check for arc pixels near the gap
+        var hasArc = checkForArc(mask, imgW, imgH, gapStart, wallY, gapEnd, wallY, gapSize)
+        if (hasArc || gapSize > 15) {
+          doors.push({
+            x: gapStart, y: wallY,
+            width: gapSize,
+            orientation: 'horizontal',
+            hasArc: hasArc
+          })
+        }
       }
     }
   })
 
   // Check gaps in vertical walls at same X
-  var vByX = groupByPos(vWalls, 'v', 12)
+  var vByX = groupByPos(vWalls, 'v', 10)
   Object.keys(vByX).forEach(function(key) {
     var segs = vByX[key].sort(function(a,b){return a.y1-b.y1})
     for (var i = 0; i < segs.length - 1; i++) {
@@ -238,13 +243,16 @@ function detectDoors(hWalls, vWalls, mask, imgW, imgH, env) {
 
       if (env && (Math.abs(wallX - env.left) < boundaryTol || Math.abs(wallX - env.right) < boundaryTol)) continue
 
-      if (gapSize > 8 && gapSize < 70) {
-        doors.push({
-          x: wallX, y: gapStart,
-          endX: wallX, endY: gapEnd,
-          width: gapSize,
-          orientation: 'vertical'
-        })
+      if (gapSize > 10 && gapSize < 80) {
+        var hasArc = checkForArc(mask, imgW, imgH, wallX, gapStart, wallX, gapEnd, gapSize)
+        if (hasArc || gapSize > 15) {
+          doors.push({
+            x: wallX, y: gapStart,
+            width: gapSize,
+            orientation: 'vertical',
+            hasArc: hasArc
+          })
+        }
       }
     }
   })
@@ -263,7 +271,53 @@ function groupByPos(walls, axis, tol) {
   return groups
 }
 
+// Check if there are arc-shaped dark pixels near a gap (door swing indicator)
+function checkForArc(mask, imgW, imgH, x1, y1, x2, y2, gapSize) {
+  var radius = gapSize
+  var cx, cy
+  var darkCount = 0
+  var totalChecked = 0
 
+  if (y1 === y2) {
+    // Horizontal gap — check for arc above and below
+    cx = x1; cy = y1
+    for (var angle = 0; angle < 90; angle += 5) {
+      var rad = angle * Math.PI / 180
+      // Check below
+      var px = Math.round(cx + radius * Math.cos(rad))
+      var py = Math.round(cy + radius * Math.sin(rad))
+      if (px >= 0 && px < imgW && py >= 0 && py < imgH) {
+        totalChecked++
+        if (mask[py * imgW + px]) darkCount++
+      }
+      // Check above
+      py = Math.round(cy - radius * Math.sin(rad))
+      if (px >= 0 && px < imgW && py >= 0 && py < imgH) {
+        totalChecked++
+        if (mask[py * imgW + px]) darkCount++
+      }
+    }
+  } else {
+    // Vertical gap
+    cx = x1; cy = y1
+    for (var angle2 = 0; angle2 < 90; angle2 += 5) {
+      var rad2 = angle2 * Math.PI / 180
+      var px2 = Math.round(cx + radius * Math.cos(rad2))
+      var py2 = Math.round(cy + radius * Math.sin(rad2))
+      if (px2 >= 0 && px2 < imgW && py2 >= 0 && py2 < imgH) {
+        totalChecked++
+        if (mask[py2 * imgW + px2]) darkCount++
+      }
+      px2 = Math.round(cx - radius * Math.cos(rad2))
+      if (px2 >= 0 && px2 < imgW && py2 >= 0 && py2 < imgH) {
+        totalChecked++
+        if (mask[py2 * imgW + px2]) darkCount++
+      }
+    }
+  }
+
+  return totalChecked > 0 && (darkCount / totalChecked) > 0.15
+}
 
 
 function filterOneEnd(walls, cross, axis, tol) {
@@ -285,79 +339,59 @@ function filterOneEnd(walls, cross, axis, tol) {
   })
 }
 
-// Check what % of pixels along a wall are actually thick (solid wall vs text)
-// Real wall: 70-100% of pixels are thick. Text: 20-50% (gaps between characters).
 function filterBySolidity(walls, thickMap, imgWidth, minThick, minSolidity, axis) {
   return walls.filter(function(w) {
     var thickCount = 0, totalCount = 0
-
     if (axis === 'h') {
-      var y = w.y1
       for (var x = w.x1; x <= w.x2; x += 2) {
         totalCount++
-        if (y >= 0 && y * imgWidth + x < thickMap.length && thickMap[y * imgWidth + x] >= minThick) thickCount++
+        var idx = w.y1 * imgWidth + x
+        if (idx >= 0 && idx < thickMap.length && thickMap[idx] >= minThick) thickCount++
       }
     } else {
-      var x = w.x1
-      for (var y2 = w.y1; y2 <= w.y2; y2 += 2) {
+      for (var y = w.y1; y <= w.y2; y += 2) {
         totalCount++
-        if (y2 * imgWidth + x >= 0 && y2 * imgWidth + x < thickMap.length && thickMap[y2 * imgWidth + x] >= minThick) thickCount++
+        var idx2 = y * imgWidth + w.x1
+        if (idx2 >= 0 && idx2 < thickMap.length && thickMap[idx2] >= minThick) thickCount++
       }
     }
-
     if (totalCount === 0) return false
     return (thickCount / totalCount) >= minSolidity
   })
 }
 
-// Remove walls that are very close to a longer parallel wall (false duplicates)
 function removeNearbyDuplicates(walls, axis, minDist) {
   if (walls.length < 2) return walls
-
-  // Sort by position
   var sorted = walls.slice().sort(function(a, b) {
     return axis === 'h' ? a.y1 - b.y1 : a.x1 - b.x1
   })
-
-  var keep = new Array(sorted.length)
-  for (var i = 0; i < keep.length; i++) keep[i] = true
-
+  var keep = []
+  for (var i = 0; i < sorted.length; i++) keep.push(true)
   for (var i = 0; i < sorted.length; i++) {
     if (!keep[i]) continue
     for (var j = i + 1; j < sorted.length; j++) {
       if (!keep[j]) continue
-
       var posA = axis === 'h' ? sorted[i].y1 : sorted[i].x1
       var posB = axis === 'h' ? sorted[j].y1 : sorted[j].x1
-
-      // Stop checking once positions are far apart
       if (Math.abs(posB - posA) > minDist) break
-
-      // Check if they overlap significantly along their length
-      var overlapStart, overlapEnd, lenA, lenB
+      var oStart, oEnd, lenA, lenB
       if (axis === 'h') {
-        overlapStart = Math.max(sorted[i].x1, sorted[j].x1)
-        overlapEnd = Math.min(sorted[i].x2, sorted[j].x2)
+        oStart = Math.max(sorted[i].x1, sorted[j].x1)
+        oEnd = Math.min(sorted[i].x2, sorted[j].x2)
         lenA = sorted[i].x2 - sorted[i].x1
         lenB = sorted[j].x2 - sorted[j].x1
       } else {
-        overlapStart = Math.max(sorted[i].y1, sorted[j].y1)
-        overlapEnd = Math.min(sorted[i].y2, sorted[j].y2)
+        oStart = Math.max(sorted[i].y1, sorted[j].y1)
+        oEnd = Math.min(sorted[i].y2, sorted[j].y2)
         lenA = sorted[i].y2 - sorted[i].y1
         lenB = sorted[j].y2 - sorted[j].y1
       }
-
-      var overlap = overlapEnd - overlapStart
-      var shorterLen = Math.min(lenA, lenB)
-
-      // If the shorter wall overlaps > 50% with the longer one, remove the shorter
-      if (overlap > shorterLen * 0.5) {
-        if (lenA >= lenB) { keep[j] = false }
+      if (oEnd - oStart > Math.min(lenA, lenB) * 0.5) {
+        if (lenA >= lenB) keep[j] = false
         else { keep[i] = false; break }
       }
     }
   }
-
   return sorted.filter(function(w, idx) { return keep[idx] })
 }
 
@@ -516,20 +550,15 @@ export default function FloorPlanAnalyzer() {
     allW.forEach(function(w){ctx.beginPath();ctx.moveTo(X(w.x1),Y(w.y1));ctx.lineTo(X(w.x2),Y(w.y2));ctx.stroke()})
 
     // Draw door arcs
-    ctx.strokeStyle='#6B7280';ctx.lineWidth=1.2
+    ctx.strokeStyle='#6B7280';ctx.lineWidth=1.5
     ;(analysis.doors||[]).forEach(function(d){
       var dwPx=S(d.width)
-      if (dwPx < 5) return
       if(d.orientation==='horizontal'){
-        // Hinge at left side of gap, swing down
-        var hx=X(d.x), hy=Y(d.y)
-        ctx.beginPath();ctx.arc(hx,hy,dwPx,-Math.PI/2,0,false);ctx.stroke()
-        ctx.beginPath();ctx.moveTo(hx,hy);ctx.lineTo(hx+dwPx,hy);ctx.stroke()
+        ctx.beginPath();ctx.arc(X(d.x),Y(d.y),dwPx,0,Math.PI/2,false);ctx.stroke()
+        ctx.beginPath();ctx.moveTo(X(d.x),Y(d.y));ctx.lineTo(X(d.x),Y(d.y)+dwPx);ctx.stroke()
       }else{
-        // Hinge at top of gap, swing right
-        var hx2=X(d.x), hy2=Y(d.y)
-        ctx.beginPath();ctx.arc(hx2,hy2,dwPx,0,Math.PI/2,false);ctx.stroke()
-        ctx.beginPath();ctx.moveTo(hx2,hy2);ctx.lineTo(hx2,hy2+dwPx);ctx.stroke()
+        ctx.beginPath();ctx.arc(X(d.x),Y(d.y),dwPx,0,Math.PI/2,false);ctx.stroke()
+        ctx.beginPath();ctx.moveTo(X(d.x),Y(d.y));ctx.lineTo(X(d.x)+dwPx,Y(d.y));ctx.stroke()
       }
     })
 
