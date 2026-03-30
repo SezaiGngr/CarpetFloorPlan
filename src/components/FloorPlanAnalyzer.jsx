@@ -23,6 +23,90 @@ Return JSON:
 Return ONLY valid JSON.`
 
 
+// ─── GAP CLASSIFICATION: WINDOW vs T-WALL vs OPEN ───────────────────────────
+//
+// Scans the actual pixel content inside a wall gap to determine what it is:
+//
+// WINDOW: thin parallel lines (1-4 dark px) within wall band, nothing deep
+// T-WALL: thick block + dark pixels extending far beyond wall band
+// OPEN:   mostly empty
+
+function classifyGap(mask, imgW, imgH, wallPos, gapStart, gapEnd, axis) {
+  var WALL_HALF = 8
+  var DEEP_SCAN = 25
+
+  var gapLen = gapEnd - gapStart
+  if (gapLen < 3) return 'noise'
+
+  var thinLineRows = 0
+  var thickRows = 0
+  var emptyRows = 0
+  var deepDarkTotal = 0
+  var totalScanned = 0
+
+  for (var g = gapStart + 1; g < gapEnd - 1; g++) {
+    var nearDark = 0
+    var deepDark = 0
+
+    if (axis === 'h') {
+      for (var dy = -WALL_HALF; dy <= WALL_HALF; dy++) {
+        var sy = wallPos + dy
+        if (sy >= 0 && sy < imgH && mask[sy * imgW + g]) nearDark++
+      }
+      for (var dy2 = WALL_HALF + 1; dy2 <= WALL_HALF + DEEP_SCAN; dy2++) {
+        var syUp = wallPos - dy2
+        var syDown = wallPos + dy2
+        if (syUp >= 0 && mask[syUp * imgW + g]) deepDark++
+        if (syDown < imgH && mask[syDown * imgW + g]) deepDark++
+      }
+    } else {
+      for (var dx = -WALL_HALF; dx <= WALL_HALF; dx++) {
+        var sx = wallPos + dx
+        if (sx >= 0 && sx < imgW && mask[g * imgW + sx]) nearDark++
+      }
+      for (var dx2 = WALL_HALF + 1; dx2 <= WALL_HALF + DEEP_SCAN; dx2++) {
+        var sxL = wallPos - dx2
+        var sxR = wallPos + dx2
+        if (sxL >= 0 && mask[g * imgW + sxL]) deepDark++
+        if (sxR < imgW && mask[g * imgW + sxR]) deepDark++
+      }
+    }
+
+    totalScanned++
+    deepDarkTotal += deepDark
+
+    if (nearDark === 0) emptyRows++
+    else if (nearDark <= 4) thinLineRows++
+    else thickRows++
+  }
+
+  if (totalScanned === 0) return 'noise'
+
+  var thinRatio = thinLineRows / totalScanned
+  var thickRatio = thickRows / totalScanned
+  var emptyRatio = emptyRows / totalScanned
+  var deepAvg = deepDarkTotal / totalScanned
+
+  // T-WALL: thick rows with dark pixels extending deep past the wall
+  if (thickRatio > 0.3 && deepAvg > 3) return 'twall'
+
+  // WINDOW: thin lines within wall band, nothing extending deep
+  if (thinLineRows >= 2 && thinRatio > 0.15 && deepAvg < 2) return 'window'
+
+  // Small gap with some content → likely window or noise
+  if (gapLen <= 15 && emptyRatio < 0.8) return 'window'
+
+  // Mostly empty
+  if (emptyRatio > 0.7) return 'open'
+
+  // Lots of deep extension → T-wall
+  if (deepAvg > 4) return 'twall'
+
+  if (gapLen <= 20) return 'window'
+  return 'open'
+}
+
+
 // ─── WALL DETECTION ──────────────────────────────────────────────────────────
 
 function detectWalls(imageData, width, height) {
@@ -118,11 +202,24 @@ function detectWalls(imageData, width, height) {
   // Step 10: Detect doors BEFORE joining
   var doors = detectDoors(mH, mV, mask, width, height, env)
 
-  // Step 11: Join collinear segments
-  mH = joinCollinear(mH, 'h', MERGE_TOL, 25)
-  mV = joinCollinear(mV, 'v', MERGE_TOL, 25)
+  // ═══════════════════════════════════════════════════════════════════════
+  // THIS IS THE ACTUAL FIX — joinCollinear was the real culprit all along.
+  //
+  // PREVIOUS BUG: joinCollinear bridged ALL gaps ≤ 25px between collinear
+  // wall segments, including T-wall junctions. By the time closeWindowGaps
+  // ran, the gap was already gone — so all my classifyGap fixes never fired.
+  //
+  // FIX: Pass the pixel mask to joinCollinear. Before bridging any gap > 5px,
+  // it now calls classifyGap(). T-wall gaps are left open; window/noise gaps
+  // are bridged. This is where the decision MUST happen because joinCollinear
+  // runs first.
+  // ═══════════════════════════════════════════════════════════════════════
 
-  // Step 12: Close window gaps — passes mask for pixel-level gap classification
+  // Step 11: Join collinear segments — NOW WITH GAP CLASSIFICATION
+  mH = joinCollinear(mH, 'h', MERGE_TOL, 25, mask, width, height)
+  mV = joinCollinear(mV, 'v', MERGE_TOL, 25, mask, width, height)
+
+  // Step 12: Close remaining window gaps on boundary walls
   if (env) {
     mH = closeWindowGaps(mH, mV, env, 'h', 15, mask, width, height)
     mV = closeWindowGaps(mV, mH, env, 'v', 15, mask, width, height)
@@ -136,136 +233,95 @@ function detectWalls(imageData, width, height) {
 }
 
 
-// ─── GAP CLASSIFICATION: WINDOW vs T-WALL vs OPEN ───────────────────────────
+// ─── JOIN COLLINEAR — NOW WITH T-WALL AWARENESS ─────────────────────────────
 //
-// This is the core distinction the algorithm needs:
+// PREVIOUS BUG: Blindly bridged all gaps ≤ maxGap between collinear segments.
+// This merged wall segments across T-wall junctions, destroying L/T/U shapes.
 //
-// WINDOW (bridge the gap):
-//   - Thin parallel lines (1-2px) inside the gap
-//   - Lines stay WITHIN the wall thickness band
-//   - No dark pixels extending far beyond the wall
-//   - Represents glass panes in floor plan notation
-//
-// T-WALL (don't bridge):
-//   - Thick block of dark pixels (4-8px, same as wall thickness)
-//   - Dark pixels extend FAR beyond the wall thickness band
-//     (the perpendicular wall goes deep into the building)
-//   - Represents a wall junction / building shape step-in
-//
-// OPEN GAP (don't bridge):
-//   - Few or no dark pixels in the gap
-//   - Represents actual opening in the building shape
+// FIX: For gaps > 5px, calls classifyGap() to check the pixel content.
+// If the gap is a T-wall junction (thick perpendicular wall crossing),
+// the segments are NOT joined — the gap is preserved.
+// Window gaps and noise are still bridged normally.
 
-function classifyGap(mask, imgW, imgH, wallPos, gapStart, gapEnd, axis) {
-  var WALL_HALF = 8   // half of typical wall thickness (search band)
-  var DEEP_SCAN = 25  // how far beyond wall band to check for T-wall
+function joinCollinear(walls, axis, posTol, maxGap, mask, imgW, imgH) {
+  if (walls.length < 2) return walls
+  var sorted = walls.slice().sort(function(a, b) {
+    return axis === 'h' ? a.y1 - b.y1 || a.x1 - b.x1 : a.x1 - b.x1 || a.y1 - b.y1
+  })
 
-  var gapLen = gapEnd - gapStart
-  if (gapLen < 3) return 'noise'  // trivially small, bridge it
+  var result = []
+  var cur = {x1: sorted[0].x1, y1: sorted[0].y1, x2: sorted[0].x2, y2: sorted[0].y2}
 
-  var thinLineRows = 0   // scan lines with thin dark pattern (window indicator)
-  var thickRows = 0       // scan lines with thick dark pattern (wall indicator)
-  var emptyRows = 0       // scan lines with no dark pixels
-  var deepDarkTotal = 0   // dark pixels extending beyond wall band (T-wall indicator)
-  var totalScanned = 0
+  for (var i = 1; i < sorted.length; i++) {
+    var s = sorted[i]
+    var samePos = axis === 'h'
+      ? Math.abs(s.y1 - cur.y1) <= posTol
+      : Math.abs(s.x1 - cur.x1) <= posTol
 
-  // Scan across the gap, one row/column at a time
-  for (var g = gapStart + 1; g < gapEnd - 1; g++) {
-    var nearDark = 0   // dark pixels within wall thickness band
-    var deepDark = 0   // dark pixels extending beyond wall band
-
+    var gapSize, gapStart, gapEnd
     if (axis === 'h') {
-      // Horizontal wall at y=wallPos, gap runs along x from gapStart to gapEnd
-      // Scan vertically at x=g across the wall thickness and beyond
-
-      // Count dark pixels within wall band
-      for (var dy = -WALL_HALF; dy <= WALL_HALF; dy++) {
-        var sy = wallPos + dy
-        if (sy >= 0 && sy < imgH && mask[sy * imgW + g]) nearDark++
-      }
-      // Count dark pixels extending beyond wall band (both sides)
-      for (var dy2 = WALL_HALF + 1; dy2 <= WALL_HALF + DEEP_SCAN; dy2++) {
-        var syUp = wallPos - dy2
-        var syDown = wallPos + dy2
-        if (syUp >= 0 && mask[syUp * imgW + g]) deepDark++
-        if (syDown < imgH && mask[syDown * imgW + g]) deepDark++
-      }
+      gapStart = cur.x2
+      gapEnd = s.x1
+      gapSize = gapEnd - gapStart
     } else {
-      // Vertical wall at x=wallPos, gap runs along y from gapStart to gapEnd
-      // Scan horizontally at y=g across the wall thickness and beyond
-
-      for (var dx = -WALL_HALF; dx <= WALL_HALF; dx++) {
-        var sx = wallPos + dx
-        if (sx >= 0 && sx < imgW && mask[g * imgW + sx]) nearDark++
-      }
-      for (var dx2 = WALL_HALF + 1; dx2 <= WALL_HALF + DEEP_SCAN; dx2++) {
-        var sxL = wallPos - dx2
-        var sxR = wallPos + dx2
-        if (sxL >= 0 && mask[g * imgW + sxL]) deepDark++
-        if (sxR < imgW && mask[g * imgW + sxR]) deepDark++
-      }
+      gapStart = cur.y2
+      gapEnd = s.y1
+      gapSize = gapEnd - gapStart
     }
 
-    totalScanned++
-    deepDarkTotal += deepDark
+    var close = samePos && gapSize <= maxGap && gapSize >= 0
 
-    if (nearDark === 0) {
-      emptyRows++
-    } else if (nearDark <= 4) {
-      // Thin line: 1-4 dark pixels within wall band = window glass
-      thinLineRows++
+    if (close) {
+      // Gap is small enough to potentially bridge.
+      // But first: check if it's a T-wall junction.
+      var shouldBridge = true
+
+      if (mask && gapSize > 5) {
+        var wallPos = axis === 'h' ? cur.y1 : cur.x1
+        var gapType = classifyGap(mask, imgW, imgH, wallPos, gapStart, gapEnd, axis)
+        if (gapType === 'twall') {
+          shouldBridge = false
+        }
+      }
+
+      if (shouldBridge) {
+        // Bridge the gap (window, noise, or small split)
+        if (axis === 'h') {
+          cur.x1 = Math.min(cur.x1, s.x1)
+          cur.x2 = Math.max(cur.x2, s.x2)
+          cur.y1 = Math.round((cur.y1 + s.y1) / 2)
+          cur.y2 = cur.y1
+        } else {
+          cur.y1 = Math.min(cur.y1, s.y1)
+          cur.y2 = Math.max(cur.y2, s.y2)
+          cur.x1 = Math.round((cur.x1 + s.x1) / 2)
+          cur.x2 = cur.x1
+        }
+      } else {
+        // T-wall junction: don't bridge, keep segments separate
+        result.push(cur)
+        cur = {x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2}
+      }
     } else {
-      // Thick line: 5+ dark pixels = part of a wall
-      thickRows++
+      // Too far apart or different line — start new segment
+      result.push(cur)
+      cur = {x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2}
     }
   }
-
-  if (totalScanned === 0) return 'noise'
-
-  var thinRatio = thinLineRows / totalScanned    // how much looks like window glass
-  var thickRatio = thickRows / totalScanned       // how much looks like wall
-  var emptyRatio = emptyRows / totalScanned       // how much is empty
-  var deepAvg = deepDarkTotal / totalScanned      // avg deep pixels per scan line
-
-  // Decision logic:
-  //
-  // T-WALL: many thick rows AND significant dark pixels extending deep
-  // This means a perpendicular wall is crossing through the gap
-  if (thickRatio > 0.3 && deepAvg > 3) return 'twall'
-
-  // WINDOW: multiple thin lines, minimal deep extension
-  // This means thin glass lines within the wall band only
-  if (thinLineRows >= 2 && thinRatio > 0.15 && deepAvg < 2) return 'window'
-
-  // Small gap with some content but ambiguous → likely window or noise
-  if (gapLen <= 15 && emptyRatio < 0.8) return 'window'
-
-  // Mostly empty gap → open space in building shape
-  if (emptyRatio > 0.7) return 'open'
-
-  // Lots of deep extension → probably T-wall even if near-wall is thin
-  if (deepAvg > 4) return 'twall'
-
-  // Default: some dark content but not clearly window or T-wall
-  // If small enough, treat as bridgeable; otherwise leave open
-  if (gapLen <= 20) return 'window'
-  return 'open'
+  result.push(cur)
+  return result
 }
 
 
-// ─── WINDOW GAP CLOSING (SHAPE-AGNOSTIC) ────────────────────────────────────
-//
-// For each gap in a boundary wall, uses classifyGap() to determine if
-// the gap is a window (bridge) or a T-wall/open gap (don't bridge).
-//
-// This works for ANY building shape — rectangular, L, T, U, irregular.
-// No assumption about straight boundary lines.
+// ─── WINDOW GAP CLOSING (boundary walls) ─────────────────────────────────────
+// After joinCollinear has preserved T-wall gaps, this handles any remaining
+// window gaps on boundary walls that joinCollinear didn't bridge
+// (e.g. gaps slightly > maxGap that are still windows).
 
 function closeWindowGaps(walls, crossWalls, env, axis, boundaryTol, mask, imgW, imgH) {
   var result = []
   var boundarySegs = []
 
-  // Separate boundary walls from interior walls
   walls.forEach(function(w) {
     var pos = axis === 'h' ? w.y1 : w.x1
     var onBoundary = false
@@ -280,7 +336,6 @@ function closeWindowGaps(walls, crossWalls, env, axis, boundaryTol, mask, imgW, 
     else result.push(w)
   })
 
-  // Group boundary segments by position (same line within tolerance)
   var groups = {}
   boundarySegs.forEach(function(w) {
     var pos = axis === 'h' ? w.y1 : w.x1
@@ -293,25 +348,16 @@ function closeWindowGaps(walls, crossWalls, env, axis, boundaryTol, mask, imgW, 
     groups[key].push(w)
   })
 
-  // Process each boundary line
   Object.keys(groups).forEach(function(key) {
     var segs = groups[key]
     if (segs.length === 0) return
 
-    // Average position for this boundary line
     var avgPos = 0
     segs.forEach(function(s) { avgPos += (axis === 'h' ? s.y1 : s.x1) })
     avgPos = Math.round(avgPos / segs.length)
 
-    // Sort segments along the wall direction
     if (axis === 'h') {
       segs.sort(function(a, b) { return a.x1 - b.x1 })
-    } else {
-      segs.sort(function(a, b) { return a.y1 - b.y1 })
-    }
-
-    // Process gaps between consecutive segments
-    if (axis === 'h') {
       var merged = [{x1: segs[0].x1, x2: segs[0].x2}]
       for (var i = 1; i < segs.length; i++) {
         var last = merged[merged.length - 1]
@@ -320,7 +366,6 @@ function closeWindowGaps(walls, crossWalls, env, axis, boundaryTol, mask, imgW, 
         var gapSize = gapEnd - gapStart
 
         if (gapSize <= 2) {
-          // Trivial gap — always bridge
           last.x2 = Math.max(last.x2, segs[i].x2)
         } else {
           var gapType = classifyGap(mask, imgW, imgH, avgPos, gapStart, gapEnd, 'h')
@@ -334,8 +379,8 @@ function closeWindowGaps(walls, crossWalls, env, axis, boundaryTol, mask, imgW, 
       merged.forEach(function(m) {
         result.push({x1: m.x1, y1: avgPos, x2: m.x2, y2: avgPos})
       })
-
     } else {
+      segs.sort(function(a, b) { return a.y1 - b.y1 })
       var merged2 = [{y1: segs[0].y1, y2: segs[0].y2}]
       for (var j = 1; j < segs.length; j++) {
         var last2 = merged2[merged2.length - 1]
@@ -448,7 +493,7 @@ function checkForArc(mask, imgW, imgH, x1, y1, x2, y2, gapSize) {
 }
 
 
-// ─── CONNECTION FILTER (iterative, keeps long walls) ─────────────────────────
+// ─── CONNECTION FILTER ───────────────────────────────────────────────────────
 
 function filterOneEnd(walls, cross, axis, tol, minKeepLen) {
   return walls.filter(function(w) {
@@ -493,7 +538,7 @@ function filterBySolidity(walls, thickMap, imgWidth, minThick, minSolidity, axis
 }
 
 
-// ─── NEAR-DUPLICATE REMOVAL (stricter 70% overlap) ──────────────────────────
+// ─── NEAR-DUPLICATE REMOVAL ─────────────────────────────────────────────────
 
 function removeNearbyDuplicates(walls, axis, minDist) {
   if (walls.length < 2) return walls
@@ -549,23 +594,6 @@ function mergeSegments(segs, axis, tol) {
     else{m.push(c);c={x1:si.x1,y1:si.y1,x2:si.x2,y2:si.y2}}
   }
   m.push(c);return m
-}
-
-function joinCollinear(walls, axis, posTol, maxGap) {
-  if(walls.length<2)return walls
-  var sorted=walls.slice().sort(function(a,b){return axis==='h'?a.y1-b.y1||a.x1-b.x1:a.x1-b.x1||a.y1-b.y1})
-  var result=[],cur={x1:sorted[0].x1,y1:sorted[0].y1,x2:sorted[0].x2,y2:sorted[0].y2}
-  for(var i=1;i<sorted.length;i++){
-    var s=sorted[i]
-    var samePos=axis==='h'?Math.abs(s.y1-cur.y1)<=posTol:Math.abs(s.x1-cur.x1)<=posTol
-    var close=false
-    if(samePos){close=axis==='h'?s.x1<=cur.x2+maxGap:s.y1<=cur.y2+maxGap}
-    if(samePos&&close){
-      if(axis==='h'){cur.x1=Math.min(cur.x1,s.x1);cur.x2=Math.max(cur.x2,s.x2);cur.y1=Math.round((cur.y1+s.y1)/2);cur.y2=cur.y1}
-      else{cur.y1=Math.min(cur.y1,s.y1);cur.y2=Math.max(cur.y2,s.y2);cur.x1=Math.round((cur.x1+s.x1)/2);cur.x2=cur.x1}
-    }else{result.push(cur);cur={x1:s.x1,y1:s.y1,x2:s.x2,y2:s.y2}}
-  }
-  result.push(cur);return result
 }
 
 
