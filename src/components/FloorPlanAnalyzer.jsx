@@ -105,13 +105,11 @@ function detectWalls(imageData, width, height) {
     mV = mV.filter(function(w){return w.x1>=env.left-10&&w.x1<=env.right+10})
   }
 
-  // ── BUG FIX #2: Iterative connection filter ──
-  // Old code: single pass H→V, walls could mutually eliminate each other.
-  // New: 2 passes (H→V→H) + keep long walls unconditionally (>=MIN_KEEP_LEN).
+  // Step 8: Iterative connection filter (keeps long walls)
   var MIN_KEEP_LEN = 50
   mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL, MIN_KEEP_LEN)
   mV = filterOneEnd(mV, mH, 'v', CONNECT_TOL, MIN_KEEP_LEN)
-  mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL, MIN_KEEP_LEN) // 2nd pass
+  mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL, MIN_KEEP_LEN)
 
   // Step 9: Solidity filter
   mH = filterBySolidity(mH, vThick, width, MIN_THICK, 0.4, 'h')
@@ -124,13 +122,13 @@ function detectWalls(imageData, width, height) {
   mH = joinCollinear(mH, 'h', MERGE_TOL, 25)
   mV = joinCollinear(mV, 'v', MERGE_TOL, 25)
 
-  // ── BUG FIX #1: Gap-bridging window closure ──
+  // Step 12: Close window gaps — passes mask for pixel-level gap classification
   if (env) {
-    mH = closeWindowGaps(mH, env, 'h', 15)
-    mV = closeWindowGaps(mV, env, 'v', 15)
+    mH = closeWindowGaps(mH, mV, env, 'h', 15, mask, width, height)
+    mV = closeWindowGaps(mV, mH, env, 'v', 15, mask, width, height)
   }
 
-  // ── BUG FIX #3: Stricter duplicate removal ──
+  // Step 13: Remove near-duplicates
   mH = removeNearbyDuplicates(mH, 'h', 20)
   mV = removeNearbyDuplicates(mV, 'v', 20)
 
@@ -138,89 +136,226 @@ function detectWalls(imageData, width, height) {
 }
 
 
-// ─── BUG FIX #1: WINDOW GAP CLOSING ─────────────────────────────────────────
+// ─── GAP CLASSIFICATION: WINDOW vs T-WALL vs OPEN ───────────────────────────
 //
-// ROOT CAUSE: Old code created ONE continuous wall per boundary spanning the
-// full envelope (env.left→env.right or env.top→env.bottom). This forced every
-// building into a rectangular outline, destroying L/T/U shapes.
+// This is the core distinction the algorithm needs:
 //
-// FIX: Only bridge SMALL gaps (<= MAX_WINDOW_GAP px) between consecutive
-// boundary segments. Large gaps are real features of the building shape
-// (step-ins, setbacks, courtyards) and must be preserved.
+// WINDOW (bridge the gap):
+//   - Thin parallel lines (1-2px) inside the gap
+//   - Lines stay WITHIN the wall thickness band
+//   - No dark pixels extending far beyond the wall
+//   - Represents glass panes in floor plan notation
 //
-// This works for ANY building footprint — rectangular, L, T, U, or irregular.
+// T-WALL (don't bridge):
+//   - Thick block of dark pixels (4-8px, same as wall thickness)
+//   - Dark pixels extend FAR beyond the wall thickness band
+//     (the perpendicular wall goes deep into the building)
+//   - Represents a wall junction / building shape step-in
+//
+// OPEN GAP (don't bridge):
+//   - Few or no dark pixels in the gap
+//   - Represents actual opening in the building shape
 
-function closeWindowGaps(walls, env, axis, boundaryTol) {
+function classifyGap(mask, imgW, imgH, wallPos, gapStart, gapEnd, axis) {
+  var WALL_HALF = 8   // half of typical wall thickness (search band)
+  var DEEP_SCAN = 25  // how far beyond wall band to check for T-wall
+
+  var gapLen = gapEnd - gapStart
+  if (gapLen < 3) return 'noise'  // trivially small, bridge it
+
+  var thinLineRows = 0   // scan lines with thin dark pattern (window indicator)
+  var thickRows = 0       // scan lines with thick dark pattern (wall indicator)
+  var emptyRows = 0       // scan lines with no dark pixels
+  var deepDarkTotal = 0   // dark pixels extending beyond wall band (T-wall indicator)
+  var totalScanned = 0
+
+  // Scan across the gap, one row/column at a time
+  for (var g = gapStart + 1; g < gapEnd - 1; g++) {
+    var nearDark = 0   // dark pixels within wall thickness band
+    var deepDark = 0   // dark pixels extending beyond wall band
+
+    if (axis === 'h') {
+      // Horizontal wall at y=wallPos, gap runs along x from gapStart to gapEnd
+      // Scan vertically at x=g across the wall thickness and beyond
+
+      // Count dark pixels within wall band
+      for (var dy = -WALL_HALF; dy <= WALL_HALF; dy++) {
+        var sy = wallPos + dy
+        if (sy >= 0 && sy < imgH && mask[sy * imgW + g]) nearDark++
+      }
+      // Count dark pixels extending beyond wall band (both sides)
+      for (var dy2 = WALL_HALF + 1; dy2 <= WALL_HALF + DEEP_SCAN; dy2++) {
+        var syUp = wallPos - dy2
+        var syDown = wallPos + dy2
+        if (syUp >= 0 && mask[syUp * imgW + g]) deepDark++
+        if (syDown < imgH && mask[syDown * imgW + g]) deepDark++
+      }
+    } else {
+      // Vertical wall at x=wallPos, gap runs along y from gapStart to gapEnd
+      // Scan horizontally at y=g across the wall thickness and beyond
+
+      for (var dx = -WALL_HALF; dx <= WALL_HALF; dx++) {
+        var sx = wallPos + dx
+        if (sx >= 0 && sx < imgW && mask[g * imgW + sx]) nearDark++
+      }
+      for (var dx2 = WALL_HALF + 1; dx2 <= WALL_HALF + DEEP_SCAN; dx2++) {
+        var sxL = wallPos - dx2
+        var sxR = wallPos + dx2
+        if (sxL >= 0 && mask[g * imgW + sxL]) deepDark++
+        if (sxR < imgW && mask[g * imgW + sxR]) deepDark++
+      }
+    }
+
+    totalScanned++
+    deepDarkTotal += deepDark
+
+    if (nearDark === 0) {
+      emptyRows++
+    } else if (nearDark <= 4) {
+      // Thin line: 1-4 dark pixels within wall band = window glass
+      thinLineRows++
+    } else {
+      // Thick line: 5+ dark pixels = part of a wall
+      thickRows++
+    }
+  }
+
+  if (totalScanned === 0) return 'noise'
+
+  var thinRatio = thinLineRows / totalScanned    // how much looks like window glass
+  var thickRatio = thickRows / totalScanned       // how much looks like wall
+  var emptyRatio = emptyRows / totalScanned       // how much is empty
+  var deepAvg = deepDarkTotal / totalScanned      // avg deep pixels per scan line
+
+  // Decision logic:
+  //
+  // T-WALL: many thick rows AND significant dark pixels extending deep
+  // This means a perpendicular wall is crossing through the gap
+  if (thickRatio > 0.3 && deepAvg > 3) return 'twall'
+
+  // WINDOW: multiple thin lines, minimal deep extension
+  // This means thin glass lines within the wall band only
+  if (thinLineRows >= 2 && thinRatio > 0.15 && deepAvg < 2) return 'window'
+
+  // Small gap with some content but ambiguous → likely window or noise
+  if (gapLen <= 15 && emptyRatio < 0.8) return 'window'
+
+  // Mostly empty gap → open space in building shape
+  if (emptyRatio > 0.7) return 'open'
+
+  // Lots of deep extension → probably T-wall even if near-wall is thin
+  if (deepAvg > 4) return 'twall'
+
+  // Default: some dark content but not clearly window or T-wall
+  // If small enough, treat as bridgeable; otherwise leave open
+  if (gapLen <= 20) return 'window'
+  return 'open'
+}
+
+
+// ─── WINDOW GAP CLOSING (SHAPE-AGNOSTIC) ────────────────────────────────────
+//
+// For each gap in a boundary wall, uses classifyGap() to determine if
+// the gap is a window (bridge) or a T-wall/open gap (don't bridge).
+//
+// This works for ANY building shape — rectangular, L, T, U, irregular.
+// No assumption about straight boundary lines.
+
+function closeWindowGaps(walls, crossWalls, env, axis, boundaryTol, mask, imgW, imgH) {
   var result = []
-  var boundaryGroups = {}
-  var MAX_WINDOW_GAP = 60  // typical window gap in pixels; anything wider = real gap
+  var boundarySegs = []
 
+  // Separate boundary walls from interior walls
   walls.forEach(function(w) {
     var pos = axis === 'h' ? w.y1 : w.x1
     var onBoundary = false
-    var bKey = ''
-
     if (axis === 'h') {
-      if (Math.abs(pos - env.top) < boundaryTol) { onBoundary = true; bKey = 'top' }
-      else if (Math.abs(pos - env.bottom) < boundaryTol) { onBoundary = true; bKey = 'bottom' }
+      onBoundary = Math.abs(pos - env.top) < boundaryTol ||
+                   Math.abs(pos - env.bottom) < boundaryTol
     } else {
-      if (Math.abs(pos - env.left) < boundaryTol) { onBoundary = true; bKey = 'left' }
-      else if (Math.abs(pos - env.right) < boundaryTol) { onBoundary = true; bKey = 'right' }
+      onBoundary = Math.abs(pos - env.left) < boundaryTol ||
+                   Math.abs(pos - env.right) < boundaryTol
     }
-
-    if (onBoundary) {
-      if (!boundaryGroups[bKey]) boundaryGroups[bKey] = []
-      boundaryGroups[bKey].push(w)
-    } else {
-      result.push(w)
-    }
+    if (onBoundary) boundarySegs.push(w)
+    else result.push(w)
   })
 
-  Object.keys(boundaryGroups).forEach(function(key) {
-    var segs = boundaryGroups[key]
+  // Group boundary segments by position (same line within tolerance)
+  var groups = {}
+  boundarySegs.forEach(function(w) {
+    var pos = axis === 'h' ? w.y1 : w.x1
+    var foundKey = null
+    Object.keys(groups).forEach(function(k) {
+      if (Math.abs(parseInt(k) - pos) <= boundaryTol && !foundKey) foundKey = k
+    })
+    var key = foundKey || String(pos)
+    if (!groups[key]) groups[key] = []
+    groups[key].push(w)
+  })
+
+  // Process each boundary line
+  Object.keys(groups).forEach(function(key) {
+    var segs = groups[key]
     if (segs.length === 0) return
 
-    if (axis === 'h') {
-      // Sort boundary segments left→right
-      segs.sort(function(a, b) { return a.x1 - b.x1 })
-      var avgY = 0
-      segs.forEach(function(s) { avgY += s.y1 })
-      avgY = Math.round(avgY / segs.length)
+    // Average position for this boundary line
+    var avgPos = 0
+    segs.forEach(function(s) { avgPos += (axis === 'h' ? s.y1 : s.x1) })
+    avgPos = Math.round(avgPos / segs.length)
 
-      // Bridge only small gaps (windows), keep large gaps (L-shape steps etc.)
+    // Sort segments along the wall direction
+    if (axis === 'h') {
+      segs.sort(function(a, b) { return a.x1 - b.x1 })
+    } else {
+      segs.sort(function(a, b) { return a.y1 - b.y1 })
+    }
+
+    // Process gaps between consecutive segments
+    if (axis === 'h') {
       var merged = [{x1: segs[0].x1, x2: segs[0].x2}]
       for (var i = 1; i < segs.length; i++) {
         var last = merged[merged.length - 1]
-        var gap = segs[i].x1 - last.x2
-        if (gap <= MAX_WINDOW_GAP) {
+        var gapStart = last.x2
+        var gapEnd = segs[i].x1
+        var gapSize = gapEnd - gapStart
+
+        if (gapSize <= 2) {
+          // Trivial gap — always bridge
           last.x2 = Math.max(last.x2, segs[i].x2)
         } else {
-          merged.push({x1: segs[i].x1, x2: segs[i].x2})
+          var gapType = classifyGap(mask, imgW, imgH, avgPos, gapStart, gapEnd, 'h')
+          if (gapType === 'window' || gapType === 'noise') {
+            last.x2 = Math.max(last.x2, segs[i].x2)
+          } else {
+            merged.push({x1: segs[i].x1, x2: segs[i].x2})
+          }
         }
       }
       merged.forEach(function(m) {
-        result.push({x1: m.x1, y1: avgY, x2: m.x2, y2: avgY})
+        result.push({x1: m.x1, y1: avgPos, x2: m.x2, y2: avgPos})
       })
 
     } else {
-      // Sort boundary segments top→bottom
-      segs.sort(function(a, b) { return a.y1 - b.y1 })
-      var avgX = 0
-      segs.forEach(function(s) { avgX += s.x1 })
-      avgX = Math.round(avgX / segs.length)
+      var merged2 = [{y1: segs[0].y1, y2: segs[0].y2}]
+      for (var j = 1; j < segs.length; j++) {
+        var last2 = merged2[merged2.length - 1]
+        var gapStart2 = last2.y2
+        var gapEnd2 = segs[j].y1
+        var gapSize2 = gapEnd2 - gapStart2
 
-      var merged = [{y1: segs[0].y1, y2: segs[0].y2}]
-      for (var i = 1; i < segs.length; i++) {
-        var last = merged[merged.length - 1]
-        var gap = segs[i].y1 - last.y2
-        if (gap <= MAX_WINDOW_GAP) {
-          last.y2 = Math.max(last.y2, segs[i].y2)
+        if (gapSize2 <= 2) {
+          last2.y2 = Math.max(last2.y2, segs[j].y2)
         } else {
-          merged.push({y1: segs[i].y1, y2: segs[i].y2})
+          var gapType2 = classifyGap(mask, imgW, imgH, avgPos, gapStart2, gapEnd2, 'v')
+          if (gapType2 === 'window' || gapType2 === 'noise') {
+            last2.y2 = Math.max(last2.y2, segs[j].y2)
+          } else {
+            merged2.push({y1: segs[j].y1, y2: segs[j].y2})
+          }
         }
       }
-      merged.forEach(function(m) {
-        result.push({x1: avgX, y1: m.y1, x2: avgX, y2: m.y2})
+      merged2.forEach(function(m) {
+        result.push({x1: avgPos, y1: m.y1, x2: avgPos, y2: m.y2})
       })
     }
   })
@@ -288,7 +423,6 @@ function groupByPos(walls, axis, tol) {
 function checkForArc(mask, imgW, imgH, x1, y1, x2, y2, gapSize) {
   var radius = gapSize
   var cx, cy, darkCount = 0, totalChecked = 0
-
   if (y1 === y2) {
     cx = x1; cy = y1
     for (var angle = 0; angle < 90; angle += 5) {
@@ -314,25 +448,12 @@ function checkForArc(mask, imgW, imgH, x1, y1, x2, y2, gapSize) {
 }
 
 
-// ─── BUG FIX #2: CONNECTION FILTER ──────────────────────────────────────────
-//
-// ROOT CAUSE: Old filterOneEnd required EVERY wall to touch a perpendicular
-// wall within 25px tolerance. Two problems:
-// (a) Short step-in walls (L-shape connectors) got killed because their
-//     matching perpendicular walls hadn't been confirmed yet.
-// (b) Single-pass H→V meant walls could mutually eliminate each other.
-//
-// FIX:
-// - Added minKeepLen: walls longer than this are ALWAYS kept — long walls
-//   are almost certainly real (perimeter walls, party walls, step-ins).
-// - Called iteratively: H→V→H so connections found in pass 2 rescue walls
-//   that would have been lost in a single pass.
+// ─── CONNECTION FILTER (iterative, keeps long walls) ─────────────────────────
 
 function filterOneEnd(walls, cross, axis, tol, minKeepLen) {
   return walls.filter(function(w) {
     var len = axis === 'h' ? (w.x2 - w.x1) : (w.y2 - w.y1)
-    if (len >= minKeepLen) return true  // always keep long walls
-
+    if (len >= minKeepLen) return true
     var connected = false
     cross.forEach(function(cw) {
       if (connected) return
@@ -372,13 +493,7 @@ function filterBySolidity(walls, thickMap, imgWidth, minThick, minSolidity, axis
 }
 
 
-// ─── BUG FIX #3: NEAR-DUPLICATE REMOVAL ─────────────────────────────────────
-//
-// ROOT CAUSE: Old threshold of 50% overlap was too aggressive. Legitimate
-// closely-spaced parallel walls (double-stud, adjacent dividers) got removed.
-//
-// FIX: Raised overlap threshold to 70%. Only truly redundant duplicates
-// (same wall detected twice) are removed. Distinct parallel walls survive.
+// ─── NEAR-DUPLICATE REMOVAL (stricter 70% overlap) ──────────────────────────
 
 function removeNearbyDuplicates(walls, axis, minDist) {
   if (walls.length < 2) return walls
@@ -406,7 +521,7 @@ function removeNearbyDuplicates(walls, axis, minDist) {
         lenA = sorted[i].y2 - sorted[i].y1
         lenB = sorted[j].y2 - sorted[j].y1
       }
-      if (oEnd - oStart > Math.min(lenA, lenB) * 0.7) {  // was 0.5
+      if (oEnd - oStart > Math.min(lenA, lenB) * 0.7) {
         if (lenA >= lenB) keep[j] = false
         else { keep[i] = false; break }
       }
