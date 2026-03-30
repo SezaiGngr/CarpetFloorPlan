@@ -139,7 +139,6 @@ function detectWalls(imageData, width, height) {
 // Find segments on the same exterior edge and bridge gaps between them.
 
 function closeWindowGaps(walls, env, axis, boundaryTol) {
-  // Group walls by whether they're on a boundary
   var result = []
   var boundaryGroups = {}
 
@@ -164,27 +163,22 @@ function closeWindowGaps(walls, env, axis, boundaryTol) {
     }
   })
 
-  // For each boundary, merge all segments into one continuous wall
+  // For each boundary, create one continuous wall spanning the full building extent
   Object.keys(boundaryGroups).forEach(function(key) {
     var segs = boundaryGroups[key]
-    if (segs.length <= 1) {
-      segs.forEach(function(s) { result.push(s) })
-      return
-    }
 
-    // Find the full span
     if (axis === 'h') {
-      var minX = Infinity, maxX = -Infinity, avgY = 0
-      segs.forEach(function(s) {
-        minX = Math.min(minX, s.x1); maxX = Math.max(maxX, s.x2); avgY += s.y1
-      })
-      result.push({x1: minX, y1: Math.round(avgY/segs.length), x2: maxX, y2: Math.round(avgY/segs.length)})
+      // Horizontal boundary wall: span from env.left to env.right
+      var avgY = 0
+      segs.forEach(function(s) { avgY += s.y1 })
+      avgY = Math.round(avgY / segs.length)
+      result.push({x1: env.left, y1: avgY, x2: env.right, y2: avgY})
     } else {
-      var minY = Infinity, maxY = -Infinity, avgX = 0
-      segs.forEach(function(s) {
-        minY = Math.min(minY, s.y1); maxY = Math.max(maxY, s.y2); avgX += s.x1
-      })
-      result.push({x1: Math.round(avgX/segs.length), y1: minY, x2: Math.round(avgX/segs.length), y2: maxY})
+      // Vertical boundary wall: span from env.top to env.bottom
+      var avgX = 0
+      segs.forEach(function(s) { avgX += s.x1 })
+      avgX = Math.round(avgX / segs.length)
+      result.push({x1: avgX, y1: env.top, x2: avgX, y2: env.bottom})
     }
   })
 
