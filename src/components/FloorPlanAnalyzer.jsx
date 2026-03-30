@@ -207,12 +207,16 @@ export default function FloorPlanAnalyzer() {
       })
 
       setLoadingStep('Parsing results…')
-      const data = await response.json()
-      console.log('[CarpetPlan] API response status:', response.status, data)
-      if (!response.ok) {
-        const msg = data.error?.message || data.message || JSON.stringify(data).slice(0, 200)
-        throw new Error('API ' + response.status + ': ' + msg)
+      const responseText = await response.text()
+      console.log('[CarpetPlan] API status:', response.status, 'body preview:', responseText.slice(0, 300))
+
+      if (!response.ok || responseText.trim().startsWith('<')) {
+        throw new Error('API ' + response.status + ': ' + responseText.slice(0, 200))
       }
+
+      let data
+      try { data = JSON.parse(responseText) }
+      catch (e) { throw new Error('Server returned non-JSON: ' + responseText.slice(0, 200)) }
 
       const raw = data.content.map(b => b.text || '').join('')
       const clean = raw.replace(/```json|```/g, '').trim()
