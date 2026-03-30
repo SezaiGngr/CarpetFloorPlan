@@ -105,30 +105,33 @@ function detectWalls(imageData, width, height) {
     mV = mV.filter(function(w){return w.x1>=env.left-10&&w.x1<=env.right+10})
   }
 
-  // Step 8: Connection filter (one end must touch perpendicular wall)
-  mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL)
-  mV = filterOneEnd(mV, mH, 'v', CONNECT_TOL)
-
-  // Step 8b: Solidity filter — walls must be >= 40% thick pixels
-  // Text characters have gaps, so only ~20-30% of their pixels are thick.
-  // Real walls are 70-100%. Threshold at 40% catches text but keeps walls.
-  mH = filterBySolidity(mH, vThick, width, MIN_THICK, 0.4, 'h')
-  mV = filterBySolidity(mV, hThick, width, MIN_THICK, 0.4, 'v')
-
-  // Step 9: Detect doors BEFORE joining (gaps still exist)
-  var doors = detectDoors(mH, mV, mask, width, height, env)
-
-  // Step 10: Join collinear segments (split walls) with max 25px gap
-  mH = joinCollinear(mH, 'h', MERGE_TOL, 25)
-  mV = joinCollinear(mV, 'v', MERGE_TOL, 25)
-
-  // Step 11: Close window gaps on EXTERIOR walls only
+  // Step 8: Close window gaps on EXTERIOR walls FIRST
+  // This must happen BEFORE connection filter, because:
+  // - Windows break exterior walls into fragments
+  // - Interior walls connecting at window locations fail the connection test
+  // - By closing windows first, exterior walls become solid
+  // - Then interior walls connecting to them pass the filter
   if (env) {
     mH = closeWindowGaps(mH, env, 'h', 15)
     mV = closeWindowGaps(mV, env, 'v', 15)
   }
 
-  // Step 12: Remove near-duplicate parallel walls (< 20px apart, overlapping)
+  // Step 9: Connection filter (one end must touch perpendicular wall)
+  mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL)
+  mV = filterOneEnd(mV, mH, 'v', CONNECT_TOL)
+
+  // Step 10: Solidity filter — walls must be >= 40% thick pixels
+  mH = filterBySolidity(mH, vThick, width, MIN_THICK, 0.4, 'h')
+  mV = filterBySolidity(mV, hThick, width, MIN_THICK, 0.4, 'v')
+
+  // Step 11: Detect doors BEFORE joining (gaps still exist)
+  var doors = detectDoors(mH, mV, mask, width, height, env)
+
+  // Step 12: Join collinear segments (split walls) with max 25px gap
+  mH = joinCollinear(mH, 'h', MERGE_TOL, 25)
+  mV = joinCollinear(mV, 'v', MERGE_TOL, 25)
+
+  // Step 13: Remove near-duplicate parallel walls (< 20px apart, overlapping)
   mH = removeNearbyDuplicates(mH, 'h', 20)
   mV = removeNearbyDuplicates(mV, 'v', 20)
 
