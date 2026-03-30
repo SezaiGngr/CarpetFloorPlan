@@ -134,9 +134,13 @@ function detectWalls(imageData, width, height) {
 }
 
 
-// ─── WINDOW GAP CLOSING ─────────────────────────────────────────────────────
+// ─── WINDOW GAP CLOSING (FIXED) ─────────────────────────────────────────────
 // Only close gaps on exterior walls (walls at the building boundary).
 // Find segments on the same exterior edge and bridge gaps between them.
+//
+// FIX: Instead of spanning the full envelope (which forces a rectangle),
+// only span from the actual min to max extent of the detected segments
+// on each boundary. This preserves L-shaped and irregular footprints.
 
 function closeWindowGaps(walls, env, axis, boundaryTol) {
   var result = []
@@ -163,22 +167,33 @@ function closeWindowGaps(walls, env, axis, boundaryTol) {
     }
   })
 
-  // For each boundary, create one continuous wall spanning the full building extent
+  // For each boundary, create one continuous wall spanning the ACTUAL extent
+  // of the detected segments (not the full envelope).
   Object.keys(boundaryGroups).forEach(function(key) {
     var segs = boundaryGroups[key]
 
     if (axis === 'h') {
-      // Horizontal boundary wall: span from env.left to env.right
+      // Horizontal boundary wall: span from actual leftmost to rightmost segment extent
       var avgY = 0
-      segs.forEach(function(s) { avgY += s.y1 })
+      var minX = Infinity, maxX = -Infinity
+      segs.forEach(function(s) {
+        avgY += s.y1
+        minX = Math.min(minX, s.x1)
+        maxX = Math.max(maxX, s.x2)
+      })
       avgY = Math.round(avgY / segs.length)
-      result.push({x1: env.left, y1: avgY, x2: env.right, y2: avgY})
+      result.push({x1: minX, y1: avgY, x2: maxX, y2: avgY})
     } else {
-      // Vertical boundary wall: span from env.top to env.bottom
+      // Vertical boundary wall: span from actual topmost to bottommost segment extent
       var avgX = 0
-      segs.forEach(function(s) { avgX += s.x1 })
+      var minY = Infinity, maxY = -Infinity
+      segs.forEach(function(s) {
+        avgX += s.x1
+        minY = Math.min(minY, s.y1)
+        maxY = Math.max(maxY, s.y2)
+      })
       avgX = Math.round(avgX / segs.length)
-      result.push({x1: avgX, y1: env.top, x2: avgX, y2: env.bottom})
+      result.push({x1: avgX, y1: minY, x2: avgX, y2: maxY})
     }
   })
 
