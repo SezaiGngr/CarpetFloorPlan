@@ -105,28 +105,32 @@ function detectWalls(imageData, width, height) {
     mV = mV.filter(function(w){return w.x1>=env.left-10&&w.x1<=env.right+10})
   }
 
-  // Step 8: Connection filter (one end must touch perpendicular wall)
-  mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL)
-  mV = filterOneEnd(mV, mH, 'v', CONNECT_TOL)
+  // ── BUG FIX #2: Iterative connection filter ──
+  // Old code: single pass H→V, walls could mutually eliminate each other.
+  // New: 2 passes (H→V→H) + keep long walls unconditionally (>=MIN_KEEP_LEN).
+  var MIN_KEEP_LEN = 50
+  mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL, MIN_KEEP_LEN)
+  mV = filterOneEnd(mV, mH, 'v', CONNECT_TOL, MIN_KEEP_LEN)
+  mH = filterOneEnd(mH, mV, 'h', CONNECT_TOL, MIN_KEEP_LEN) // 2nd pass
 
-  // Step 9: Solidity filter — walls must be >= 40% thick pixels
+  // Step 9: Solidity filter
   mH = filterBySolidity(mH, vThick, width, MIN_THICK, 0.4, 'h')
   mV = filterBySolidity(mV, hThick, width, MIN_THICK, 0.4, 'v')
 
-  // Step 10: Detect doors BEFORE joining (gaps still exist)
+  // Step 10: Detect doors BEFORE joining
   var doors = detectDoors(mH, mV, mask, width, height, env)
 
-  // Step 11: Join collinear segments (split walls) with max 25px gap
+  // Step 11: Join collinear segments
   mH = joinCollinear(mH, 'h', MERGE_TOL, 25)
   mV = joinCollinear(mV, 'v', MERGE_TOL, 25)
 
-  // Step 12: Close window gaps on EXTERIOR walls only
+  // ── BUG FIX #1: Gap-bridging window closure ──
   if (env) {
     mH = closeWindowGaps(mH, env, 'h', 15)
     mV = closeWindowGaps(mV, env, 'v', 15)
   }
 
-  // Step 13: Remove near-duplicate parallel walls (< 20px apart, overlapping)
+  // ── BUG FIX #3: Stricter duplicate removal ──
   mH = removeNearbyDuplicates(mH, 'h', 20)
   mV = removeNearbyDuplicates(mV, 'v', 20)
 
@@ -134,17 +138,22 @@ function detectWalls(imageData, width, height) {
 }
 
 
-// ─── WINDOW GAP CLOSING (FIXED) ─────────────────────────────────────────────
-// Only close gaps on exterior walls (walls at the building boundary).
-// Find segments on the same exterior edge and bridge gaps between them.
+// ─── BUG FIX #1: WINDOW GAP CLOSING ─────────────────────────────────────────
 //
-// FIX: Instead of spanning the full envelope (which forces a rectangle),
-// only span from the actual min to max extent of the detected segments
-// on each boundary. This preserves L-shaped and irregular footprints.
+// ROOT CAUSE: Old code created ONE continuous wall per boundary spanning the
+// full envelope (env.left→env.right or env.top→env.bottom). This forced every
+// building into a rectangular outline, destroying L/T/U shapes.
+//
+// FIX: Only bridge SMALL gaps (<= MAX_WINDOW_GAP px) between consecutive
+// boundary segments. Large gaps are real features of the building shape
+// (step-ins, setbacks, courtyards) and must be preserved.
+//
+// This works for ANY building footprint — rectangular, L, T, U, or irregular.
 
 function closeWindowGaps(walls, env, axis, boundaryTol) {
   var result = []
   var boundaryGroups = {}
+  var MAX_WINDOW_GAP = 60  // typical window gap in pixels; anything wider = real gap
 
   walls.forEach(function(w) {
     var pos = axis === 'h' ? w.y1 : w.x1
@@ -167,33 +176,52 @@ function closeWindowGaps(walls, env, axis, boundaryTol) {
     }
   })
 
-  // For each boundary, create one continuous wall spanning the ACTUAL extent
-  // of the detected segments (not the full envelope).
   Object.keys(boundaryGroups).forEach(function(key) {
     var segs = boundaryGroups[key]
+    if (segs.length === 0) return
 
     if (axis === 'h') {
-      // Horizontal boundary wall: span from actual leftmost to rightmost segment extent
+      // Sort boundary segments left→right
+      segs.sort(function(a, b) { return a.x1 - b.x1 })
       var avgY = 0
-      var minX = Infinity, maxX = -Infinity
-      segs.forEach(function(s) {
-        avgY += s.y1
-        minX = Math.min(minX, s.x1)
-        maxX = Math.max(maxX, s.x2)
-      })
+      segs.forEach(function(s) { avgY += s.y1 })
       avgY = Math.round(avgY / segs.length)
-      result.push({x1: minX, y1: avgY, x2: maxX, y2: avgY})
-    } else {
-      // Vertical boundary wall: span from actual topmost to bottommost segment extent
-      var avgX = 0
-      var minY = Infinity, maxY = -Infinity
-      segs.forEach(function(s) {
-        avgX += s.x1
-        minY = Math.min(minY, s.y1)
-        maxY = Math.max(maxY, s.y2)
+
+      // Bridge only small gaps (windows), keep large gaps (L-shape steps etc.)
+      var merged = [{x1: segs[0].x1, x2: segs[0].x2}]
+      for (var i = 1; i < segs.length; i++) {
+        var last = merged[merged.length - 1]
+        var gap = segs[i].x1 - last.x2
+        if (gap <= MAX_WINDOW_GAP) {
+          last.x2 = Math.max(last.x2, segs[i].x2)
+        } else {
+          merged.push({x1: segs[i].x1, x2: segs[i].x2})
+        }
+      }
+      merged.forEach(function(m) {
+        result.push({x1: m.x1, y1: avgY, x2: m.x2, y2: avgY})
       })
+
+    } else {
+      // Sort boundary segments top→bottom
+      segs.sort(function(a, b) { return a.y1 - b.y1 })
+      var avgX = 0
+      segs.forEach(function(s) { avgX += s.x1 })
       avgX = Math.round(avgX / segs.length)
-      result.push({x1: avgX, y1: minY, x2: avgX, y2: maxY})
+
+      var merged = [{y1: segs[0].y1, y2: segs[0].y2}]
+      for (var i = 1; i < segs.length; i++) {
+        var last = merged[merged.length - 1]
+        var gap = segs[i].y1 - last.y2
+        if (gap <= MAX_WINDOW_GAP) {
+          last.y2 = Math.max(last.y2, segs[i].y2)
+        } else {
+          merged.push({y1: segs[i].y1, y2: segs[i].y2})
+        }
+      }
+      merged.forEach(function(m) {
+        result.push({x1: avgX, y1: m.y1, x2: avgX, y2: m.y2})
+      })
     }
   })
 
@@ -202,14 +230,11 @@ function closeWindowGaps(walls, env, axis, boundaryTol) {
 
 
 // ─── DOOR DETECTION ──────────────────────────────────────────────────────────
-// Doors are gaps in walls where there are arc-shaped dark pixels nearby.
-// We find gaps between wall segments at the same position and check for arcs.
 
 function detectDoors(hWalls, vWalls, mask, imgW, imgH, env) {
   var doors = []
   var boundaryTol = 15
 
-  // Check gaps in horizontal walls at same Y
   var hByY = groupByPos(hWalls, 'h', 10)
   Object.keys(hByY).forEach(function(key) {
     var segs = hByY[key].sort(function(a,b){return a.x1-b.x1})
@@ -218,27 +243,16 @@ function detectDoors(hWalls, vWalls, mask, imgW, imgH, env) {
       var gapEnd = segs[i+1].x1
       var gapSize = gapEnd - gapStart
       var wallY = segs[i].y1
-
-      // Skip if on exterior boundary (those are windows, already closed)
       if (env && (Math.abs(wallY - env.top) < boundaryTol || Math.abs(wallY - env.bottom) < boundaryTol)) continue
-
-      // Door gaps are typically 15-60px wide
       if (gapSize > 10 && gapSize < 80) {
-        // Check for arc pixels near the gap
         var hasArc = checkForArc(mask, imgW, imgH, gapStart, wallY, gapEnd, wallY, gapSize)
         if (hasArc || gapSize > 15) {
-          doors.push({
-            x: gapStart, y: wallY,
-            width: gapSize,
-            orientation: 'horizontal',
-            hasArc: hasArc
-          })
+          doors.push({ x: gapStart, y: wallY, width: gapSize, orientation: 'horizontal', hasArc: hasArc })
         }
       }
     }
   })
 
-  // Check gaps in vertical walls at same X
   var vByX = groupByPos(vWalls, 'v', 10)
   Object.keys(vByX).forEach(function(key) {
     var segs = vByX[key].sort(function(a,b){return a.y1-b.y1})
@@ -247,18 +261,11 @@ function detectDoors(hWalls, vWalls, mask, imgW, imgH, env) {
       var gapEnd = segs[i+1].y1
       var gapSize = gapEnd - gapStart
       var wallX = segs[i].x1
-
       if (env && (Math.abs(wallX - env.left) < boundaryTol || Math.abs(wallX - env.right) < boundaryTol)) continue
-
       if (gapSize > 10 && gapSize < 80) {
         var hasArc = checkForArc(mask, imgW, imgH, wallX, gapStart, wallX, gapEnd, gapSize)
         if (hasArc || gapSize > 15) {
-          doors.push({
-            x: wallX, y: gapStart,
-            width: gapSize,
-            orientation: 'vertical',
-            hasArc: hasArc
-          })
+          doors.push({ x: wallX, y: gapStart, width: gapSize, orientation: 'vertical', hasArc: hasArc })
         }
       }
     }
@@ -278,57 +285,54 @@ function groupByPos(walls, axis, tol) {
   return groups
 }
 
-// Check if there are arc-shaped dark pixels near a gap (door swing indicator)
 function checkForArc(mask, imgW, imgH, x1, y1, x2, y2, gapSize) {
   var radius = gapSize
-  var cx, cy
-  var darkCount = 0
-  var totalChecked = 0
+  var cx, cy, darkCount = 0, totalChecked = 0
 
   if (y1 === y2) {
-    // Horizontal gap — check for arc above and below
     cx = x1; cy = y1
     for (var angle = 0; angle < 90; angle += 5) {
       var rad = angle * Math.PI / 180
-      // Check below
       var px = Math.round(cx + radius * Math.cos(rad))
       var py = Math.round(cy + radius * Math.sin(rad))
-      if (px >= 0 && px < imgW && py >= 0 && py < imgH) {
-        totalChecked++
-        if (mask[py * imgW + px]) darkCount++
-      }
-      // Check above
+      if (px >= 0 && px < imgW && py >= 0 && py < imgH) { totalChecked++; if (mask[py * imgW + px]) darkCount++ }
       py = Math.round(cy - radius * Math.sin(rad))
-      if (px >= 0 && px < imgW && py >= 0 && py < imgH) {
-        totalChecked++
-        if (mask[py * imgW + px]) darkCount++
-      }
+      if (px >= 0 && px < imgW && py >= 0 && py < imgH) { totalChecked++; if (mask[py * imgW + px]) darkCount++ }
     }
   } else {
-    // Vertical gap
     cx = x1; cy = y1
     for (var angle2 = 0; angle2 < 90; angle2 += 5) {
       var rad2 = angle2 * Math.PI / 180
       var px2 = Math.round(cx + radius * Math.cos(rad2))
       var py2 = Math.round(cy + radius * Math.sin(rad2))
-      if (px2 >= 0 && px2 < imgW && py2 >= 0 && py2 < imgH) {
-        totalChecked++
-        if (mask[py2 * imgW + px2]) darkCount++
-      }
+      if (px2 >= 0 && px2 < imgW && py2 >= 0 && py2 < imgH) { totalChecked++; if (mask[py2 * imgW + px2]) darkCount++ }
       px2 = Math.round(cx - radius * Math.cos(rad2))
-      if (px2 >= 0 && px2 < imgW && py2 >= 0 && py2 < imgH) {
-        totalChecked++
-        if (mask[py2 * imgW + px2]) darkCount++
-      }
+      if (px2 >= 0 && px2 < imgW && py2 >= 0 && py2 < imgH) { totalChecked++; if (mask[py2 * imgW + px2]) darkCount++ }
     }
   }
-
   return totalChecked > 0 && (darkCount / totalChecked) > 0.15
 }
 
 
-function filterOneEnd(walls, cross, axis, tol) {
+// ─── BUG FIX #2: CONNECTION FILTER ──────────────────────────────────────────
+//
+// ROOT CAUSE: Old filterOneEnd required EVERY wall to touch a perpendicular
+// wall within 25px tolerance. Two problems:
+// (a) Short step-in walls (L-shape connectors) got killed because their
+//     matching perpendicular walls hadn't been confirmed yet.
+// (b) Single-pass H→V meant walls could mutually eliminate each other.
+//
+// FIX:
+// - Added minKeepLen: walls longer than this are ALWAYS kept — long walls
+//   are almost certainly real (perimeter walls, party walls, step-ins).
+// - Called iteratively: H→V→H so connections found in pass 2 rescue walls
+//   that would have been lost in a single pass.
+
+function filterOneEnd(walls, cross, axis, tol, minKeepLen) {
   return walls.filter(function(w) {
+    var len = axis === 'h' ? (w.x2 - w.x1) : (w.y2 - w.y1)
+    if (len >= minKeepLen) return true  // always keep long walls
+
     var connected = false
     cross.forEach(function(cw) {
       if (connected) return
@@ -367,6 +371,15 @@ function filterBySolidity(walls, thickMap, imgWidth, minThick, minSolidity, axis
   })
 }
 
+
+// ─── BUG FIX #3: NEAR-DUPLICATE REMOVAL ─────────────────────────────────────
+//
+// ROOT CAUSE: Old threshold of 50% overlap was too aggressive. Legitimate
+// closely-spaced parallel walls (double-stud, adjacent dividers) got removed.
+//
+// FIX: Raised overlap threshold to 70%. Only truly redundant duplicates
+// (same wall detected twice) are removed. Distinct parallel walls survive.
+
 function removeNearbyDuplicates(walls, axis, minDist) {
   if (walls.length < 2) return walls
   var sorted = walls.slice().sort(function(a, b) {
@@ -393,7 +406,7 @@ function removeNearbyDuplicates(walls, axis, minDist) {
         lenA = sorted[i].y2 - sorted[i].y1
         lenB = sorted[j].y2 - sorted[j].y1
       }
-      if (oEnd - oStart > Math.min(lenA, lenB) * 0.5) {
+      if (oEnd - oStart > Math.min(lenA, lenB) * 0.7) {  // was 0.5
         if (lenA >= lenB) keep[j] = false
         else { keep[i] = false; break }
       }
@@ -552,11 +565,9 @@ export default function FloorPlanAnalyzer() {
     var ctx=canvas.getContext('2d');ctx.clearRect(0,0,cw,ch);ctx.fillStyle='#fff';ctx.fillRect(0,0,cw,ch)
     var X=function(p){return PAD+p*scale},Y=function(p){return PAD+p*scale},S=function(p){return p*scale}
 
-    // Draw walls
     ctx.strokeStyle='#1a1a1a';ctx.lineWidth=Math.max(2.5,4*scale);ctx.lineCap='square'
     allW.forEach(function(w){ctx.beginPath();ctx.moveTo(X(w.x1),Y(w.y1));ctx.lineTo(X(w.x2),Y(w.y2));ctx.stroke()})
 
-    // Draw door arcs
     ctx.strokeStyle='#6B7280';ctx.lineWidth=1.5
     ;(analysis.doors||[]).forEach(function(d){
       var dwPx=S(d.width)
@@ -569,7 +580,6 @@ export default function FloorPlanAnalyzer() {
       }
     })
 
-    // Dimension labels
     ctx.fillStyle='#2563eb'
     allW.forEach(function(w){
       var dx=w.x2-w.x1,dy=w.y2-w.y1,lp=Math.sqrt(dx*dx+dy*dy),sl=lp*scale
