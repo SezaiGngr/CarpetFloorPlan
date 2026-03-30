@@ -186,31 +186,51 @@ export default function FloorPlanAnalyzer() {
       // Step 2: AI analysis with pixel context
       setLoadingStep('Sending to AI with structural hints…')
       const prompt = buildPrompt(pixCtx)
+      console.log('[CarpetPlan] Prompt length:', prompt.length, 'chars')
+      console.log('[CarpetPlan] Pixel hints included:', !!pixCtx)
       const base64 = image.split(',')[1]
       const mediaType = image.split(';')[0].split(':')[1]
+
+      const reqBody = {
+        model: MODEL, max_tokens: 4096,
+        messages: [{ role: 'user', content: [
+          { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+          { type: 'text', text: prompt }
+        ]}]
+      }
+      console.log('[CarpetPlan] Request model:', MODEL, 'max_tokens:', reqBody.max_tokens)
 
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: MODEL, max_tokens: 6000,
-          messages: [{ role: 'user', content: [
-            { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-            { type: 'text', text: prompt }
-          ]}]
-        })
+        body: JSON.stringify(reqBody)
       })
 
       setLoadingStep('Parsing results…')
       const data = await response.json()
-      if (!response.ok) throw new Error(data.error?.message || 'API error')
+      console.log('[CarpetPlan] API response status:', response.status, data)
+      if (!response.ok) {
+        const msg = data.error?.message || data.message || JSON.stringify(data).slice(0, 200)
+        throw new Error('API ' + response.status + ': ' + msg)
+      }
 
       const raw = data.content.map(b => b.text || '').join('')
       const clean = raw.replace(/```json|```/g, '').trim()
-      const parsed = JSON.parse(clean)
+      console.log('[CarpetPlan] AI raw response length:', raw.length)
+      let parsed
+      try {
+        parsed = JSON.parse(clean)
+      } catch (parseErr) {
+        console.error('[CarpetPlan] JSON parse failed, raw:', clean.slice(0, 500))
+        throw new Error('AI returned invalid JSON: ' + parseErr.message)
+      }
 
-      const ppm = parsed.calibration?.unified_ppm || parsed.calibration?.pixels_per_meter
+      // Accept both old format (pixels_per_meter) and new format (unified_ppm)
+      const ppm = parsed.calibration?.unified_ppm
+        || parsed.calibration?.median_ppm_x
+        || parsed.calibration?.pixels_per_meter
       if (!ppm || ppm <= 0) {
+        console.warn('[CarpetPlan] Calibration data:', parsed.calibration)
         throw new Error('AI could not determine valid calibration. Try higher-res image with labeled dimensions.')
       }
 
@@ -405,7 +425,7 @@ export default function FloorPlanAnalyzer() {
                 <div className="fpa-cal-row">
                   <span className="cal-room">{cal.reference_rooms ? cal.reference_rooms.length+' rooms' : cal.reference_room}</span>
                   <span className="cal-eq">{cal.label_text || cal.reference_rooms?.[0]?.label}</span>
-                  <span className="cal-px">{(cal.unified_ppm||cal.pixels_per_meter)?.toFixed(1)} px/m</span>
+                  <span className="cal-px">{(cal.unified_ppm||cal.median_ppm_x||cal.pixels_per_meter)?.toFixed(1)} px/m</span>
                 </div>
                 <div className={`fpa-cal-conf ${cal.confidence}`}>{cal.confidence} confidence</div>
                 {analysis.building_outline && <div className="fpa-cal-row" style={{marginTop:4,fontSize:11,opacity:0.7}}>Shape: {analysis.building_outline.shape}</div>}
